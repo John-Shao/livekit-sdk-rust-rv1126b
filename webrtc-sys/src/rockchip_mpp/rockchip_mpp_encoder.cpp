@@ -214,11 +214,15 @@ int RockchipMppH264EncoderImpl::Encode(
   mpp_frame_set_buffer(mpp_frame, frm_buf_);
 
   // 4. Pre-bind our reusable output packet to the frame's metadata.
-  MppPacket out_pkt = nullptr;
-  mpp_packet_init_with_buffer(&out_pkt, pkt_buf_);
-  mpp_packet_set_length(out_pkt, 0);
+  //    NOTE: encode_get_packet(&packet) below will re-assign this same
+  //    variable; MPP transfers ownership through it. Deiniting both the
+  //    pre-bind handle AND the post-get handle is a double-free (per
+  //    mpi_enc_test.c which uses one variable for both phases).
+  MppPacket packet = nullptr;
+  mpp_packet_init_with_buffer(&packet, pkt_buf_);
+  mpp_packet_set_length(packet, 0);
   MppMeta meta = mpp_frame_get_meta(mpp_frame);
-  mpp_meta_set_packet(meta, KEY_OUTPUT_PACKET, out_pkt);
+  mpp_meta_set_packet(meta, KEY_OUTPUT_PACKET, packet);
 
   // 5. Submit + drain. Output timeout was set to MPP_POLL_BLOCK at init,
   //    so encode_get_packet returns when a NAL is ready (or EOS).
@@ -226,26 +230,26 @@ int RockchipMppH264EncoderImpl::Encode(
   mpp_frame_deinit(&mpp_frame);
   if (ret) {
     RTC_LOG(LS_ERROR) << "[mpp] encode_put_frame failed: " << ret;
-    mpp_packet_deinit(&out_pkt);
+    mpp_packet_deinit(&packet);
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
-  MppPacket got_pkt = nullptr;
-  ret = mpp_api_->encode_get_packet(mpp_ctx_, &got_pkt);
-  if (ret || !got_pkt) {
+  ret = mpp_api_->encode_get_packet(mpp_ctx_, &packet);
+  if (ret || !packet) {
     RTC_LOG(LS_ERROR) << "[mpp] encode_get_packet failed: " << ret;
-    mpp_packet_deinit(&out_pkt);
+    if (packet)
+      mpp_packet_deinit(&packet);
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
   const uint8_t *pkt_pos =
-      static_cast<const uint8_t *>(mpp_packet_get_pos(got_pkt));
-  size_t pkt_len = mpp_packet_get_length(got_pkt);
+      static_cast<const uint8_t *>(mpp_packet_get_pos(packet));
+  size_t pkt_len = mpp_packet_get_length(packet);
 
   // 6. Determine intra/inter via meta first, falling back to NAL parse.
   bool is_idr = false;
-  if (mpp_packet_has_meta(got_pkt)) {
-    MppMeta out_meta = mpp_packet_get_meta(got_pkt);
+  if (mpp_packet_has_meta(packet)) {
+    MppMeta out_meta = mpp_packet_get_meta(packet);
     RK_S32 intra_flag = 0;
     if (mpp_meta_get_s32(out_meta, KEY_OUTPUT_INTRA, &intra_flag) == MPP_OK) {
       is_idr = (intra_flag != 0);
@@ -303,8 +307,9 @@ int RockchipMppH264EncoderImpl::Encode(
   EncodedImageCallback::Result cb_result =
       encoded_callback_->OnEncodedImage(encoded, &codec_specific);
 
-  mpp_packet_deinit(&got_pkt);
-  mpp_packet_deinit(&out_pkt);
+  // Single deinit — the pre-bind handle and the get_packet handle are the
+  // same MppPacket; deinit twice would tank ref counts (cf. [33.x] fix).
+  mpp_packet_deinit(&packet);
 
   if (cb_result.error != EncodedImageCallback::Result::OK) {
     RTC_LOG(LS_WARNING) << "[mpp] OnEncodedImage error: "
