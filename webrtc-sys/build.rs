@@ -260,6 +260,8 @@ fn main() {
                             .include(&inc_path)
                             .file("src/rockchip_mpp/rockchip_mpp_encoder.cpp")
                             .file("src/rockchip_mpp/rockchip_mpp_encoder_factory.cpp")
+                            .file("src/rockchip_mpp/rockchip_mpp_decoder.cpp")
+                            .file("src/rockchip_mpp/rockchip_mpp_decoder_factory.cpp")
                             .flag("-DUSE_ROCKCHIP_MPP_VIDEO_CODEC=1");
                         if let Ok(lib_dir) = env::var("ROCKCHIP_MPP_LIB") {
                             println!("cargo:rustc-link-search=native={}", lib_dir);

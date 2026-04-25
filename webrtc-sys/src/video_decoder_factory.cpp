@@ -39,6 +39,10 @@
 #include "nvidia/nvidia_decoder_factory.h"
 #endif
 
+#if defined(USE_ROCKCHIP_MPP_VIDEO_CODEC)
+#include "rockchip_mpp/rockchip_mpp_decoder_factory.h"
+#endif
+
 namespace livekit_ffi {
 
 VideoDecoderFactory::VideoDecoderFactory() {
@@ -53,6 +57,17 @@ VideoDecoderFactory::VideoDecoderFactory() {
 #if defined(USE_NVIDIA_VIDEO_CODEC)
   if (webrtc::NvidiaVideoDecoderFactory::IsSupported()) {
     factories_.push_back(std::make_unique<webrtc::NvidiaVideoDecoderFactory>());
+  }
+#endif
+
+  // Rockchip MPP — RV1126B / RK3588-class hardware H.264 decoder.
+  // Same opt-in gate as the encoder factory (BOARD_LOOPBACK_USE_MPP=1 +
+  // /dev/mpp_service); when off, libwebrtc's software H.264 decoder
+  // (OpenH264 / FFmpeg internal) keeps the slot.
+#if defined(USE_ROCKCHIP_MPP_VIDEO_CODEC)
+  if (webrtc::RockchipMppVideoDecoderFactory::IsSupported()) {
+    factories_.push_back(
+        std::make_unique<webrtc::RockchipMppVideoDecoderFactory>());
   }
 #endif
 }
