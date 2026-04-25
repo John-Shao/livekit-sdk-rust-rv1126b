@@ -8,20 +8,20 @@
  * webrtc::VideoEncoder so libwebrtc's encoder selection picks it
  * up via RockchipMppVideoEncoderFactory.
  *
- * Phase 6.1 status: SKELETON ONLY. Constructors / Init / Release wired
- * but Encode() is a stub returning ERROR. RockchipMppVideoEncoderFactory
- * IsSupported() defaults to false so OpenH264 software path keeps
- * winning until Phase 6.1.4 fills in the real MPP API calls.
+ * Phase 6.1.4: real init + encode loop. I420 frames from the SDK get
+ * software-converted to NV12 into an MppBuffer, fed via encode_put_frame,
+ * the resulting H.264 NAL is pulled via encode_get_packet and shipped
+ * upstream as an EncodedImage. RGA zero-copy is Phase 6.1.5.
  */
 
 #ifndef WEBRTC_ROCKCHIP_MPP_ENCODER_IMPL_H_
 #define WEBRTC_ROCKCHIP_MPP_ENCODER_IMPL_H_
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <vector>
 
-#include "absl/container/inlined_vector.h"
 #include "api/video/i420_buffer.h"
 #include "api/video/video_codec_constants.h"
 #include "api/video_codecs/scalability_mode.h"
@@ -29,12 +29,18 @@
 #include "api/video_codecs/video_encoder.h"
 #include "common_video/h264/h264_bitstream_parser.h"
 
-// MPP API headers — provided by SDK external/mpp/inc/
-struct MppApi;
-typedef void *MppCtx;
-typedef void *MppFrame;
-typedef void *MppPacket;
-typedef void *MppBufferGroup;
+// MPP API headers — provided by SDK external/mpp/inc/, made visible by
+// build.rs adding ROCKCHIP_MPP_INCLUDE to the include path. Pull in
+// rk_mpi.h here so we can store an MppApi* member; the rest are also
+// dragged in directly because we deref into them in the .cpp anyway and
+// keeping the header self-consistent avoids forward-decl/typedef drift.
+extern "C" {
+#include "mpp_buffer.h"
+#include "mpp_frame.h"
+#include "mpp_packet.h"
+#include "rk_mpi.h"
+#include "rk_venc_cfg.h"
+}
 
 namespace webrtc {
 
@@ -59,6 +65,9 @@ private:
   int initMppContext(int width, int height, int fps, int target_bps,
                      int gop_len);
   void teardownMppContext();
+  // Apply current target_bps_ / fps_ to the live MPP cfg via MPP_ENC_SET_CFG.
+  // Returns 0 on success, otherwise MPP_RET.
+  int applyRateControl();
 
   // Format from SDP (profile-level-id, packetization-mode, etc.)
   const SdpVideoFormat format_;
@@ -69,17 +78,25 @@ private:
   // MPP runtime state. nullptr until InitEncode succeeds.
   MppCtx mpp_ctx_ = nullptr;
   MppApi *mpp_api_ = nullptr;
-  MppBufferGroup frame_buf_group_ = nullptr; // input NV12 frames
-  MppBufferGroup pkt_buf_group_ = nullptr;   // output H.264 NAL packets
+  MppBufferGroup buf_grp_ = nullptr;
+  MppBuffer frm_buf_ = nullptr; // input NV12 frame
+  MppBuffer pkt_buf_ = nullptr; // output H.264 NAL packet
+  MppEncCfg cfg_ = nullptr;
 
   // Current configuration
   int width_ = 0;
   int height_ = 0;
+  int hor_stride_ = 0; // 16-aligned width (bytes per Y row)
+  int ver_stride_ = 0; // 16-aligned height (Y rows total)
   int fps_ = 30;
   int target_bps_ = 1'500'000;
   int gop_len_ = 60;
 
-  // H.264 bitstream parser for SVC info / SPS-PPS extraction
+  // SPS/PPS cached after init via MPP_ENC_GET_HDR_SYNC; libwebrtc expects
+  // SPS/PPS prepended to the first IDR.
+  std::vector<uint8_t> hdr_pps_sps_;
+
+  // H.264 bitstream parser for QP / SVC info
   H264BitstreamParser h264_parser_;
 
   // Initialized flag — also gates Encode() against unconfigured state

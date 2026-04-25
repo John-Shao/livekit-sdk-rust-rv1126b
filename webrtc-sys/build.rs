@@ -28,6 +28,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LK_DEBUG_WEBRTC");
     println!("cargo:rerun-if-env-changed=LK_CUSTOM_WEBRTC");
     println!("cargo:rerun-if-env-changed=ROCKCHIP_MPP_INCLUDE");
+    println!("cargo:rerun-if-env-changed=ROCKCHIP_MPP_LIB");
 
     let mut rust_files = vec![
         "src/peer_connection.rs",
@@ -246,10 +247,10 @@ fn main() {
             }
 
             // Rockchip MPP — RV1126B-class SoCs (and other RK chips with
-            // librockchip_mpp). Only attempts to compile the encoder/decoder
-            // wrapper when ROCKCHIP_MPP_INCLUDE points at the SDK's
-            // external/mpp/inc directory. Library is dlopened lazily so this
-            // does not pin glibc-version-of-rockchip_mpp.
+            // librockchip_mpp). Compiles the encoder wrapper when
+            // ROCKCHIP_MPP_INCLUDE points at the SDK's external/mpp/inc dir,
+            // and direct-links librockchip_mpp.so. Optional ROCKCHIP_MPP_LIB
+            // adds a -L search path (e.g. buildroot sysroot's /usr/lib).
             if arm {
                 let mpp_inc = env::var("ROCKCHIP_MPP_INCLUDE").ok();
                 if let Some(inc) = mpp_inc {
@@ -260,9 +261,10 @@ fn main() {
                             .file("src/rockchip_mpp/rockchip_mpp_encoder.cpp")
                             .file("src/rockchip_mpp/rockchip_mpp_encoder_factory.cpp")
                             .flag("-DUSE_ROCKCHIP_MPP_VIDEO_CODEC=1");
-                        // 6.1 SKELETON: stub doesn't call any MPP API yet,
-                        // so no link/lazy-load needed. Real MPP wiring in
-                        // 6.1.4 will add add_lazy_load_so for librockchip_mpp.
+                        if let Ok(lib_dir) = env::var("ROCKCHIP_MPP_LIB") {
+                            println!("cargo:rustc-link-search=native={}", lib_dir);
+                        }
+                        println!("cargo:rustc-link-lib=dylib=rockchip_mpp");
                         println!(
                             "cargo:warning=ROCKCHIP_MPP_INCLUDE={} — Rockchip MPP encoder enabled",
                             inc
