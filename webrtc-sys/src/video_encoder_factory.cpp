@@ -45,6 +45,10 @@
 #include "vaapi/vaapi_encoder_factory.h"
 #endif
 
+#if defined(USE_ROCKCHIP_MPP_VIDEO_CODEC)
+#include "rockchip_mpp/rockchip_mpp_encoder_factory.h"
+#endif
+
 namespace livekit_ffi {
 
 using Factory = webrtc::VideoEncoderFactoryTemplate<
@@ -79,6 +83,16 @@ VideoEncoderFactory::InternalFactory::InternalFactory() {
 #endif
 
 #if defined(USE_NVIDIA_VIDEO_CODEC)
+  }
+#endif
+
+  // Rockchip MPP — RV1126B / RK3588-class hardware H.264 encoder.
+  // IsSupported() defaults to false during Phase 6.1 SKELETON;
+  // BOARD_LOOPBACK_USE_MPP=1 (and presence of /dev/mpp_service) opts in.
+#if defined(USE_ROCKCHIP_MPP_VIDEO_CODEC)
+  if (webrtc::RockchipMppVideoEncoderFactory::IsSupported()) {
+    factories_.push_back(
+        std::make_unique<webrtc::RockchipMppVideoEncoderFactory>());
   }
 #endif
 }

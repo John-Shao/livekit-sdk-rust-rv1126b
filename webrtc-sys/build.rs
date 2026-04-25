@@ -27,6 +27,7 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=LK_DEBUG_WEBRTC");
     println!("cargo:rerun-if-env-changed=LK_CUSTOM_WEBRTC");
+    println!("cargo:rerun-if-env-changed=ROCKCHIP_MPP_INCLUDE");
 
     let mut rust_files = vec![
         "src/peer_connection.rs",
@@ -241,6 +242,37 @@ fn main() {
                     );
                 } else {
                     println!("cargo:warning=cuda.h not found; building without hardware accelerated video codec support for NVidia GPUs");
+                }
+            }
+
+            // Rockchip MPP — RV1126B-class SoCs (and other RK chips with
+            // librockchip_mpp). Only attempts to compile the encoder/decoder
+            // wrapper when ROCKCHIP_MPP_INCLUDE points at the SDK's
+            // external/mpp/inc directory. Library is dlopened lazily so this
+            // does not pin glibc-version-of-rockchip_mpp.
+            if arm {
+                let mpp_inc = env::var("ROCKCHIP_MPP_INCLUDE").ok();
+                if let Some(inc) = mpp_inc {
+                    let inc_path = PathBuf::from(&inc);
+                    if inc_path.join("rk_mpi.h").exists() {
+                        builder
+                            .include(&inc_path)
+                            .file("src/rockchip_mpp/rockchip_mpp_encoder.cpp")
+                            .file("src/rockchip_mpp/rockchip_mpp_encoder_factory.cpp")
+                            .flag("-DUSE_ROCKCHIP_MPP_VIDEO_CODEC=1");
+                        // 6.1 SKELETON: stub doesn't call any MPP API yet,
+                        // so no link/lazy-load needed. Real MPP wiring in
+                        // 6.1.4 will add add_lazy_load_so for librockchip_mpp.
+                        println!(
+                            "cargo:warning=ROCKCHIP_MPP_INCLUDE={} — Rockchip MPP encoder enabled",
+                            inc
+                        );
+                    } else {
+                        println!(
+                            "cargo:warning=ROCKCHIP_MPP_INCLUDE={} doesn't contain rk_mpi.h — skipping MPP",
+                            inc
+                        );
+                    }
                 }
             }
 
