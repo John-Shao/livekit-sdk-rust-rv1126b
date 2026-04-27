@@ -916,6 +916,13 @@ pub unsafe fn cvt_nv12(
         proto::VideoBufferType::Nv12 => {
             let chroma_w = (buffer.width + 1) / 2;
             let chroma_h = (buffer.height + 1) / 2;
+            // NV12 UV is biplanar interleaved → byte stride = 2 * chroma_w
+            // (each chroma column is 2 bytes, U then V). The previous code
+            // was a copy/paste from the I420 path which uses separate U/V
+            // planes (stride = chroma_w each); for NV12 that under-sizes
+            // the destination stride and trips imgproc's
+            // `src_stride_uv >= width + width % 2` assertion.
+            let chroma_stride = chroma_w * 2;
             let mut dst =
                 vec![0u8; (width * height + chroma_w * chroma_h * 2) as usize].into_boxed_slice();
             let (dst_y, dst_uv) = {
@@ -924,7 +931,7 @@ pub unsafe fn cvt_nv12(
             };
 
             imgproc::colorcvt::nv12_copy(
-                data_y, c0.stride, data_uv, c1.stride, dst_y, width, dst_uv, chroma_w, width,
+                data_y, c0.stride, data_uv, c1.stride, dst_y, width, dst_uv, chroma_stride, width,
                 height, flip_y,
             );
 
@@ -935,7 +942,7 @@ pub unsafe fn cvt_nv12(
                 width,
                 height,
                 width,
-                chroma_w,
+                chroma_stride,
             );
             Ok((dst, info))
         }
