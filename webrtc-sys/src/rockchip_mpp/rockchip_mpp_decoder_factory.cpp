@@ -6,6 +6,7 @@
 #include "rockchip_mpp_decoder_factory.h"
 #include "rockchip_mpp_decoder.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <sys/stat.h>
 
@@ -38,22 +39,42 @@ bool RockchipMppVideoDecoderFactory::IsSupported() {
 std::unique_ptr<VideoDecoder>
 RockchipMppVideoDecoderFactory::Create(const Environment & /*env*/,
                                        const SdpVideoFormat &format) {
+  // Once-per-stream stderr trace — confirms we beat OpenH264 in the FFI's
+  // factory selection. RTC_LOG isn't routed to stdout in this build, so
+  // stderr is the only place ops can grep for hardware-codec activation.
+  std::string params;
+  for (const auto &kv : format.parameters) {
+    params += kv.first + "=" + kv.second + " ";
+  }
+  std::fprintf(stderr, "[mpp-dec] Create(%s %s)\n", format.name.c_str(),
+               params.c_str());
   return std::make_unique<RockchipMppH264DecoderImpl>(format);
 }
 
 std::vector<SdpVideoFormat>
 RockchipMppVideoDecoderFactory::GetSupportedFormats() const {
   std::vector<SdpVideoFormat> formats;
-  // Mirror the encoder side — we only advertise H.264 baseline / CB at
-  // Level 3.1 since that's what RV1126B's H.264 decoder reliably handles
-  // in our smoke tests. WebRTC will auto-fall-back to software for higher
-  // profiles (Main/High) via the parent VideoDecoderFactory.
-  formats.push_back(CreateH264Format(H264Profile::kProfileConstrainedBaseline,
-                                     H264Level::kLevel3_1, "1",
-                                     /*add_scalability_modes=*/false));
-  formats.push_back(CreateH264Format(H264Profile::kProfileBaseline,
-                                     H264Level::kLevel3_1, "1",
-                                     /*add_scalability_modes=*/false));
+  // Advertise the full H.264 profile × packetization-mode matrix that
+  // RV1126B's hardware decoder can handle (Baseline / Main / High up to
+  // 4K@60 per Rockchip docs). Level 3.1 is plenty for 720p30; we use the
+  // same level here so the SDP fmtp string parses consistently with the
+  // encoder side. libwebrtc clients commonly negotiate {Constrained
+  // Baseline, Baseline, Main} × {packetization-mode 0, 1}, so cover all
+  // six explicitly — the FFI's secondary match loop in
+  // video_decoder_factory.cpp can already absorb packetization-mode
+  // mismatches, but matching profile-level-id is strict (IsSameCodec).
+  static constexpr H264Profile kProfiles[] = {
+      H264Profile::kProfileConstrainedBaseline,
+      H264Profile::kProfileBaseline,
+      H264Profile::kProfileMain,
+  };
+  for (auto profile : kProfiles) {
+    for (const char *pkt_mode : {"1", "0"}) {
+      formats.push_back(CreateH264Format(profile, H264Level::kLevel3_1,
+                                         pkt_mode,
+                                         /*add_scalability_modes=*/false));
+    }
+  }
   return formats;
 }
 
