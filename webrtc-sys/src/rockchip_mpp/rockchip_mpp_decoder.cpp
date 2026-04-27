@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <thread>
 
 #include "api/video/i420_buffer.h"
@@ -38,15 +39,28 @@ extern "C" {
 
 namespace webrtc {
 
-RockchipMppH264DecoderImpl::RockchipMppH264DecoderImpl(
-    const SdpVideoFormat &format)
-    : format_(format), buffer_pool_(/*zero_initialize=*/false, 16) {
-  RTC_LOG(LS_INFO) << "[mpp-dec] RockchipMppH264DecoderImpl ctor";
+namespace {
+const char *codingTypeName(MppCodingType c) {
+  switch (c) {
+    case MPP_VIDEO_CodingAVC:  return "H264";
+    case MPP_VIDEO_CodingHEVC: return "H265";
+    case MPP_VIDEO_CodingVP8:  return "VP8";
+    case MPP_VIDEO_CodingVP9:  return "VP9";
+    default:                   return "Unknown";
+  }
+}
+} // namespace
+
+RockchipMppVideoDecoderImpl::RockchipMppVideoDecoderImpl(
+    const SdpVideoFormat &format, MppCodingType coding)
+    : format_(format), coding_(coding),
+      buffer_pool_(/*zero_initialize=*/false, 16) {
+  RTC_LOG(LS_INFO) << "[mpp-dec] ctor codec=" << codingTypeName(coding_);
 }
 
-RockchipMppH264DecoderImpl::~RockchipMppH264DecoderImpl() { Release(); }
+RockchipMppVideoDecoderImpl::~RockchipMppVideoDecoderImpl() { Release(); }
 
-bool RockchipMppH264DecoderImpl::Configure(const Settings & /*settings*/) {
+bool RockchipMppVideoDecoderImpl::Configure(const Settings & /*settings*/) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (initialized_)
     return true;
@@ -63,7 +77,7 @@ bool RockchipMppH264DecoderImpl::Configure(const Settings & /*settings*/) {
   return true;
 }
 
-int32_t RockchipMppH264DecoderImpl::Release() {
+int32_t RockchipMppVideoDecoderImpl::Release() {
   std::lock_guard<std::mutex> lock(mutex_);
   if (initialized_) {
     teardownMppContext();
@@ -73,14 +87,14 @@ int32_t RockchipMppH264DecoderImpl::Release() {
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-int32_t RockchipMppH264DecoderImpl::RegisterDecodeCompleteCallback(
+int32_t RockchipMppVideoDecoderImpl::RegisterDecodeCompleteCallback(
     DecodedImageCallback *callback) {
   std::lock_guard<std::mutex> lock(mutex_);
   decoded_complete_callback_ = callback;
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-int32_t RockchipMppH264DecoderImpl::Decode(const EncodedImage &input_image,
+int32_t RockchipMppVideoDecoderImpl::Decode(const EncodedImage &input_image,
                                            bool /*missing_frames*/,
                                            int64_t /*render_time_ms*/) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -141,16 +155,17 @@ int32_t RockchipMppH264DecoderImpl::Decode(const EncodedImage &input_image,
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-VideoDecoder::DecoderInfo RockchipMppH264DecoderImpl::GetDecoderInfo() const {
+VideoDecoder::DecoderInfo RockchipMppVideoDecoderImpl::GetDecoderInfo() const {
   DecoderInfo info;
-  info.implementation_name = "RockchipMpp_H264";
+  info.implementation_name =
+      std::string("RockchipMpp_") + codingTypeName(coding_);
   info.is_hardware_accelerated = true;
   return info;
 }
 
 // ---- private helpers ---------------------------------------------------
 
-int RockchipMppH264DecoderImpl::initMppContext() {
+int RockchipMppVideoDecoderImpl::initMppContext() {
   // 1. Create context + MPI vtable.
   MPP_RET ret = mpp_create(&mpp_ctx_, &mpp_api_);
   if (ret) {
@@ -159,15 +174,18 @@ int RockchipMppH264DecoderImpl::initMppContext() {
   }
 
   // 2. Decoder-specific knobs BEFORE mpp_init:
-  //    - parser_split_mode=1 lets MPP accept Annex-B streams where a
-  //      single packet may contain multiple NAL units (which is how
-  //      libwebrtc hands us H.264 from the depacketizer).
-  RK_U32 split_mode = 1;
-  ret = mpp_api_->control(mpp_ctx_, MPP_DEC_SET_PARSER_SPLIT_MODE,
-                          &split_mode);
-  if (ret) {
-    RTC_LOG(LS_ERROR) << "[mpp-dec] SET_PARSER_SPLIT_MODE failed: " << ret;
-    return ret;
+  //    - parser_split_mode=1 lets MPP accept Annex-B byte-streams where
+  //      a single packet may contain multiple NAL units (H.264 and H.265
+  //      from libwebrtc's depacketizer). VP8/VP9 frames are already
+  //      complete-per-packet, no split needed.
+  if (coding_ == MPP_VIDEO_CodingAVC || coding_ == MPP_VIDEO_CodingHEVC) {
+    RK_U32 split_mode = 1;
+    ret = mpp_api_->control(mpp_ctx_, MPP_DEC_SET_PARSER_SPLIT_MODE,
+                            &split_mode);
+    if (ret) {
+      RTC_LOG(LS_ERROR) << "[mpp-dec] SET_PARSER_SPLIT_MODE failed: " << ret;
+      return ret;
+    }
   }
 
   // 3. IO timeouts: block on input (so decode_put_packet only returns when
@@ -186,10 +204,11 @@ int RockchipMppH264DecoderImpl::initMppContext() {
     return ret;
   }
 
-  // 4. Initialize for AVC decode.
-  ret = mpp_init(mpp_ctx_, MPP_CTX_DEC, MPP_VIDEO_CodingAVC);
+  // 4. Initialize for the configured codec.
+  ret = mpp_init(mpp_ctx_, MPP_CTX_DEC, coding_);
   if (ret) {
-    RTC_LOG(LS_ERROR) << "[mpp-dec] mpp_init(DEC, AVC) failed: " << ret;
+    RTC_LOG(LS_ERROR) << "[mpp-dec] mpp_init(DEC, " << codingTypeName(coding_)
+                      << ") failed: " << ret;
     return ret;
   }
 
@@ -201,12 +220,13 @@ int RockchipMppH264DecoderImpl::initMppContext() {
     return ret;
   }
 
-  RTC_LOG(LS_INFO) << "[mpp-dec] context ready (AVC, split=1, out=100ms)";
+  RTC_LOG(LS_INFO) << "[mpp-dec] context ready (" << codingTypeName(coding_)
+                   << ", out=100ms)";
   return 0;
 }
 
-RockchipMppH264DecoderImpl::DrainResult
-RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
+RockchipMppVideoDecoderImpl::DrainResult
+RockchipMppVideoDecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
   MppFrame frame = nullptr;
   MPP_RET ret = mpp_api_->decode_get_frame(mpp_ctx_, &frame);
   if (ret == MPP_ERR_TIMEOUT || !frame) {
@@ -373,7 +393,7 @@ RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
   return DrainResult::kFrame;
 }
 
-void RockchipMppH264DecoderImpl::teardownMppContext() {
+void RockchipMppVideoDecoderImpl::teardownMppContext() {
   // Drain MPP first so its internal queues release references to our
   // external buffer group + input packet. Without this, mpp_destroy
   // leaves dangling references that libmpp's atexit service handlers

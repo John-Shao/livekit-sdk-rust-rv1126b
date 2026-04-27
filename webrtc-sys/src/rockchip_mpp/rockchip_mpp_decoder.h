@@ -3,14 +3,13 @@
  *
  * Licensed under the Apache License, Version 2.0.
  *
- * Rockchip MPP (Media Process Platform) hardware H.264 decoder for
- * RV1126B-class SoCs. Pulls inbound H.264 NAL packets out of libwebrtc,
- * shoves them at MPP via decode_put_packet, retrieves NV12 frames via
- * decode_get_frame, and surfaces them as I420 webrtc::VideoFrames so the
- * existing rendering path (DRM/KMS plane via I420→NV12 software in
- * board_loopback) keeps working unchanged.
- *
- * Phase 6.2 status: full impl. RGA zero-copy + dmabuf-direct path → 6.1.5.
+ * Rockchip MPP (Media Process Platform) hardware video decoder for
+ * RV1126B-class SoCs. Codec-generic — the same class drives H.264 / H.265
+ * / VP8 / VP9 (selected via constructor's MppCodingType param). Pulls
+ * inbound encoded packets out of libwebrtc, shoves them at MPP via
+ * decode_put_packet, retrieves NV12 frames via decode_get_frame, and
+ * surfaces them as NV12Buffer webrtc::VideoFrames so the SDK FFI's
+ * cvt_nv12 path can pass them to the consumer with a single memcpy.
  */
 
 #ifndef WEBRTC_ROCKCHIP_MPP_DECODER_IMPL_H_
@@ -33,13 +32,17 @@ extern "C" {
 
 namespace webrtc {
 
-class RockchipMppH264DecoderImpl : public VideoDecoder {
+class RockchipMppVideoDecoderImpl : public VideoDecoder {
 public:
-  explicit RockchipMppH264DecoderImpl(const SdpVideoFormat &format);
-  RockchipMppH264DecoderImpl(const RockchipMppH264DecoderImpl &) = delete;
-  RockchipMppH264DecoderImpl &
-  operator=(const RockchipMppH264DecoderImpl &) = delete;
-  ~RockchipMppH264DecoderImpl() override;
+  // `coding` selects the MPP decode pipeline (MPP_VIDEO_CodingAVC /
+  // CodingHEVC / CodingVP8 / CodingVP9). Caller (factory) maps SDP codec
+  // name → MppCodingType; from this point on all decode paths are uniform.
+  RockchipMppVideoDecoderImpl(const SdpVideoFormat &format,
+                              MppCodingType coding);
+  RockchipMppVideoDecoderImpl(const RockchipMppVideoDecoderImpl &) = delete;
+  RockchipMppVideoDecoderImpl &
+  operator=(const RockchipMppVideoDecoderImpl &) = delete;
+  ~RockchipMppVideoDecoderImpl() override;
 
   bool Configure(const Settings &settings) override;
   int32_t Decode(const EncodedImage &input_image, bool missing_frames,
@@ -50,8 +53,9 @@ public:
   DecoderInfo GetDecoderInfo() const override;
 
 private:
-  // Open MppCtx for AVC decode + configure split mode + IO timeouts.
-  // Returns 0 on success, otherwise MPP_RET.
+  // Open MppCtx for the configured codec + IO timeouts (split mode is set
+  // only for Annex-B byte-stream codecs where one packet may carry
+  // multiple NAL units, i.e. AVC/HEVC; VP8/VP9 frames don't need it).
   int initMppContext();
   void teardownMppContext();
   enum class DrainResult {
@@ -61,15 +65,12 @@ private:
     kFrame,       // delivered a real frame to decoded_complete_callback_;
                   // exit the drain loop unless caller knows more are pending
   };
-  // Drain MPP for one decode_get_frame attempt. Caller decides whether to
-  // loop based on the returned status — the previous bool-return version
-  // ate a 100ms timeout per Decode() call right after delivering a frame
-  // because it couldn't tell "frame done" apart from "info_change handled
-  // but real frame coming".
   DrainResult drainOneFrame(uint32_t rtp_timestamp);
 
   // Format from SDP (profile-level-id, packetization-mode, etc.).
   const SdpVideoFormat format_;
+  // Which MPP decoder pipeline to drive.
+  const MppCodingType coding_;
 
   // MPP runtime state. nullptr until Configure() succeeds.
   MppCtx mpp_ctx_ = nullptr;
