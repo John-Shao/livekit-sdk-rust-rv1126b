@@ -26,10 +26,10 @@
 #include <thread>
 
 #include "api/video/i420_buffer.h"
+#include "api/video/nv12_buffer.h"
 #include "api/video/video_frame.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/logging.h"
-#include "third_party/libyuv/include/libyuv/convert.h"
 
 extern "C" {
 #include "mpp_err.h"
@@ -254,21 +254,24 @@ RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
     }
     // Re-set the per-buffer size cap on every info_change. Initial cap
     // was sized for the first frame's buf_size; simulcast layer upgrades
-    // grow the frame (e.g. 92 KB → 471 KB at 180x320 → 720x480) and
-    // mpp_buffer_create then fails with "reach group size limit", which
-    // freezes decoding while audio keeps flowing — a really nasty failure
-    // mode because the group LOOKS fine. 24 buffers = mpi_dec_test default;
-    // covers worst-case reordering for B-frames-heavy AVC. WebRTC streams
-    // are typically GOP-only (no B), so we usually consume far fewer.
+    // grow the frame (e.g. 92 KB → 471 KB → 1843 KB at 180x320 → 360x640
+    // → 720x1280) and mpp_buffer_create then fails with "reach group size
+    // limit", which freezes decoding while audio keeps flowing — a really
+    // nasty failure mode because the group LOOKS fine. 24 buffers =
+    // mpi_dec_test default; covers worst-case reordering for B-frames-
+    // heavy AVC. WebRTC streams are typically GOP-only (no B), so we
+    // usually consume far fewer.
     //
-    // Deliberately *not* calling mpp_buffer_group_clear here — clearing
-    // mid-decode races with MPP's internal try_proc_dec_task worker that
-    // still holds buffer references; the resulting double-dec corrupts
-    // ref counts and surfaces as a segfault in libmpp's atexit cleanup
-    // (mpp_buffer_service_deinit / check_entry_unused). MPP releases old
-    // buffers naturally as the new ones get used; the limit bump alone is
-    // enough to let bigger allocations succeed.
+    // Also clear the group: with limit_config alone, MPP keeps the old
+    // smaller buffers in the slot table and won't reallocate them even
+    // when the new larger size is permitted. Without clearing, simulcast
+    // upgrades stall after the first higher-layer frame slot is requested.
+    // The earlier worry that clear races with MPP's worker thread turned
+    // out to be wrong — that segfault was actually about the EXIT path,
+    // which is now properly handled in teardownMppContext via
+    // MPP_DEC_SET_EXT_BUF_GROUP=NULL + reset.
     mpp_buffer_group_limit_config(frm_grp_, buf_size, 24);
+    mpp_buffer_group_clear(frm_grp_);
     MPP_RET ack_ret = mpp_api_->control(mpp_ctx_,
                                         MPP_DEC_SET_INFO_CHANGE_READY, nullptr);
     if (ack_ret) {
@@ -306,15 +309,36 @@ RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
     mpp_frame_deinit(&frame);
     return DrainResult::kNothing;
   }
+  size_t mpp_buf_bytes = mpp_buffer_get_size(buf);
+  size_t y_plane_bytes = static_cast<size_t>(hor_stride) * ver_stride;
+  size_t needed_bytes = y_plane_bytes + (y_plane_bytes / 2);
+  if (mpp_buf_bytes < needed_bytes) {
+    // Simulcast layer upgrade race: MPP delivers a frame whose stride/size
+    // doesn't fit the buffer it allocated from our group. The next
+    // info_change resizes the group; just drop this one.
+    RTC_LOG(LS_VERBOSE) << "[mpp-dec] skip frame: buf=" << mpp_buf_bytes
+                        << " < need=" << needed_bytes;
+    mpp_frame_deinit(&frame);
+    return DrainResult::kNothing;
+  }
   mpp_buffer_sync_begin(buf);
 
-  // NV12 → I420 via libyuv. The pool recycles I420Buffers so we don't
-  // allocate per-frame.
-  webrtc::scoped_refptr<webrtc::I420Buffer> i420 =
-      buffer_pool_.CreateI420Buffer(static_cast<int>(fw),
-                                    static_cast<int>(fh));
-  if (!i420) {
-    RTC_LOG(LS_ERROR) << "[mpp-dec] CreateI420Buffer failed " << fw << "x"
+  // NV12 stride-strip into a fresh NV12Buffer. We used to convert to I420
+  // via libyuv NV12ToI420 here, but the SDK FFI's downstream conversion
+  // pipeline (livekit-ffi/server/colorcvt) only supports I420→NV12 if the
+  // source is already NV12 — going through I420 forced a round trip
+  // (NV12→I420 here, I420→NV12 in the consumer's DRM display path), each
+  // ~1.4 MB at 720p × 30 fps = ~42 MB/s of pointless memory traffic per
+  // direction. Returning NV12 lets the FFI's cvt_nv12 path fall through to
+  // a single nv12_copy memcpy and the consumer skip the second conversion.
+  //
+  // MPP's hor_stride / ver_stride are usually larger than width / height
+  // (16-aligned at minimum), so we still copy row-by-row to strip stride
+  // padding into the NV12Buffer's tight (stride == width) layout.
+  webrtc::scoped_refptr<webrtc::NV12Buffer> nv12 = webrtc::NV12Buffer::Create(
+      static_cast<int>(fw), static_cast<int>(fh));
+  if (!nv12) {
+    RTC_LOG(LS_ERROR) << "[mpp-dec] NV12Buffer::Create failed " << fw << "x"
                       << fh;
     mpp_buffer_sync_end(buf);
     mpp_frame_deinit(&frame);
@@ -322,20 +346,23 @@ RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
   }
 
   const uint8_t *src_y = src;
-  const uint8_t *src_uv = src + hor_stride * ver_stride;
-  int rc = libyuv::NV12ToI420(
-      src_y, static_cast<int>(hor_stride), src_uv, static_cast<int>(hor_stride),
-      i420->MutableDataY(), i420->StrideY(), i420->MutableDataU(),
-      i420->StrideU(), i420->MutableDataV(), i420->StrideV(),
-      static_cast<int>(fw), static_cast<int>(fh));
-  mpp_buffer_sync_end(buf);
-  if (rc) {
-    RTC_LOG(LS_WARNING) << "[mpp-dec] libyuv NV12ToI420 rc=" << rc;
+  const uint8_t *src_uv = src + static_cast<size_t>(hor_stride) * ver_stride;
+  uint8_t *dst_y = nv12->MutableDataY();
+  uint8_t *dst_uv = nv12->MutableDataUV();
+  int dst_stride_y = nv12->StrideY();
+  int dst_stride_uv = nv12->StrideUV();
+  for (int row = 0; row < static_cast<int>(fh); ++row) {
+    std::memcpy(dst_y + row * dst_stride_y, src_y + row * hor_stride, fw);
   }
+  int chroma_h = (static_cast<int>(fh) + 1) / 2;
+  for (int row = 0; row < chroma_h; ++row) {
+    std::memcpy(dst_uv + row * dst_stride_uv, src_uv + row * hor_stride, fw);
+  }
+  mpp_buffer_sync_end(buf);
 
   VideoFrame decoded_frame =
       VideoFrame::Builder()
-          .set_video_frame_buffer(i420)
+          .set_video_frame_buffer(nv12)
           .set_rtp_timestamp(rtp_timestamp)
           .build();
 

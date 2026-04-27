@@ -16,6 +16,12 @@ use crate::impl_thread_safety;
 
 #[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
+    // Layout MUST mirror webrtc::VideoFrameBuffer::Type 1:1 — the C++ side
+    // does `static_cast<VideoFrameBufferType>(buffer_->type())`, which
+    // preserves the integer value. webrtc's enum has kI210 and kI410 between
+    // kI010 and kNV12 (positions 6/7); without them here, an actual NV12
+    // buffer (kNV12 = 8) gets static_cast to a discriminant the Rust enum
+    // can't represent and the dispatch site hits unreachable!.
     #[derive(Debug)]
     #[repr(i32)]
     pub enum VideoFrameBufferType {
@@ -25,6 +31,8 @@ pub mod ffi {
         I422,
         I444,
         I010,
+        I210,
+        I410,
         NV12,
     }
 

@@ -496,10 +496,16 @@ pub fn nv12_info(
         size: stride_y * height,
     };
 
+    // stride_uv is the byte stride of the interleaved UV plane (== bytes per
+    // chroma row). UV plane has chroma_height rows, so total bytes =
+    // stride_uv * chroma_height. The previous "* 2" assumed stride_uv was
+    // chroma-column count (so bytes-per-row = stride_uv * 2); after fixing
+    // cvt_nv12 to pass byte stride consistently, doubling here over-reports
+    // the UV plane size by 2x and downstream consumers walk past the buffer.
     let c2 = proto::video_buffer_info::ComponentInfo {
         data_ptr: data_uv as u64,
         stride: stride_uv,
-        size: stride_uv * chroma_height * 2,
+        size: stride_uv * chroma_height,
     };
     components.extend_from_slice(&[c1, c2]);
 
