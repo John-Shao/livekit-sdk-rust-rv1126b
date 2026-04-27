@@ -30,6 +30,7 @@
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/time_utils.h"
+#include "third_party/libyuv/include/libyuv/convert_from.h"
 
 extern "C" {
 // rockchip_mpp_encoder.h already pulls in rk_mpi.h / mpp_buffer.h / ...
@@ -45,31 +46,22 @@ namespace {
 constexpr int kAlign = 16;
 inline int AlignUp(int x, int a) { return (x + a - 1) & ~(a - 1); }
 
-// Software I420 → NV12 (semi-planar): Y plane copied as-is (with stride
-// padding), U/V interleaved into a single plane. Output written into the
-// MppBuffer that backs an MppFrame at the given hor/ver strides.
+// I420 → NV12 (semi-planar): Y plane copied as-is (with stride padding),
+// U/V interleaved into a single plane. Output written into the MppBuffer
+// that backs an MppFrame at the given hor/ver strides.
+//
+// Backed by libyuv::I420ToNV12 which is NEON-vectorized on aarch64 — at
+// 720p the previous hand-rolled scalar interleave loop was ~10x slower
+// per frame.
 void I420ToNV12(const uint8_t *src_y, int src_stride_y, const uint8_t *src_u,
                 int src_stride_u, const uint8_t *src_v, int src_stride_v,
                 int width, int height, uint8_t *dst, int hor_stride,
                 int ver_stride) {
-  // Y plane
-  for (int row = 0; row < height; ++row) {
-    std::memcpy(dst + row * hor_stride, src_y + row * src_stride_y, width);
-  }
-  // UV plane (interleaved, half height/width). NV12 layout begins at
-  // hor_stride * ver_stride bytes after the start of the buffer.
-  uint8_t *uv_plane = dst + hor_stride * ver_stride;
-  const int half_w = width / 2;
-  const int half_h = height / 2;
-  for (int row = 0; row < half_h; ++row) {
-    uint8_t *dst_uv = uv_plane + row * hor_stride;
-    const uint8_t *src_u_row = src_u + row * src_stride_u;
-    const uint8_t *src_v_row = src_v + row * src_stride_v;
-    for (int col = 0; col < half_w; ++col) {
-      dst_uv[2 * col] = src_u_row[col];
-      dst_uv[2 * col + 1] = src_v_row[col];
-    }
-  }
+  uint8_t *dst_y = dst;
+  uint8_t *dst_uv = dst + static_cast<size_t>(hor_stride) * ver_stride;
+  ::libyuv::I420ToNV12(src_y, src_stride_y, src_u, src_stride_u, src_v,
+                       src_stride_v, dst_y, hor_stride, dst_uv, hor_stride,
+                       width, height);
 }
 
 // Look at the first NAL unit header to decide if a packet starts with an
