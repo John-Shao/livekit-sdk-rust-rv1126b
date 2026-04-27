@@ -260,9 +260,15 @@ RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
     // mode because the group LOOKS fine. 24 buffers = mpi_dec_test default;
     // covers worst-case reordering for B-frames-heavy AVC. WebRTC streams
     // are typically GOP-only (no B), so we usually consume far fewer.
+    //
+    // Deliberately *not* calling mpp_buffer_group_clear here — clearing
+    // mid-decode races with MPP's internal try_proc_dec_task worker that
+    // still holds buffer references; the resulting double-dec corrupts
+    // ref counts and surfaces as a segfault in libmpp's atexit cleanup
+    // (mpp_buffer_service_deinit / check_entry_unused). MPP releases old
+    // buffers naturally as the new ones get used; the limit bump alone is
+    // enough to let bigger allocations succeed.
     mpp_buffer_group_limit_config(frm_grp_, buf_size, 24);
-    // Clear stale buffers so MPP can repopulate at the new size.
-    mpp_buffer_group_clear(frm_grp_);
     MPP_RET ack_ret = mpp_api_->control(mpp_ctx_,
                                         MPP_DEC_SET_INFO_CHANGE_READY, nullptr);
     if (ack_ret) {
@@ -348,6 +354,15 @@ void RockchipMppH264DecoderImpl::teardownMppContext() {
   // up — touching freed memory and segfaulting at process exit.
   if (mpp_api_ && mpp_ctx_) {
     mpp_api_->reset(mpp_ctx_);
+  }
+  // Detach buffer group from the decoder before destroy so mpp_destroy
+  // doesn't keep references to a group we're about to put. mpi_dec_test
+  // does the clear+put dance via dec_buf_mgr_deinit; we inline it here.
+  if (mpp_api_ && mpp_ctx_ && frm_grp_) {
+    mpp_api_->control(mpp_ctx_, MPP_DEC_SET_EXT_BUF_GROUP, nullptr);
+  }
+  if (frm_grp_) {
+    mpp_buffer_group_clear(frm_grp_);
   }
   if (packet_) {
     mpp_packet_deinit(&packet_);
