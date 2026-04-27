@@ -416,6 +416,44 @@ pub fn nv12_to_i420(
     });
 }
 
+pub fn i420_to_nv12(
+    src_y: &[u8],
+    src_stride_y: u32,
+    src_u: &[u8],
+    src_stride_u: u32,
+    src_v: &[u8],
+    src_stride_v: u32,
+    dst_y: &mut [u8],
+    dst_stride_y: u32,
+    dst_uv: &mut [u8],
+    dst_stride_uv: u32,
+    width: u32,
+    height: u32,
+    flip_y: bool,
+) {
+    assert::valid_420(src_y, src_stride_y, src_u, src_stride_u, src_v, src_stride_v, width, height);
+    assert::valid_nv12(dst_y, dst_stride_y, dst_uv, dst_stride_uv, width, height);
+
+    let height = height as i32 * if flip_y { -1 } else { 1 };
+
+    assert!(unsafe {
+        yuv_sys::rs_I420ToNV12(
+            src_y.as_ptr(),
+            src_stride_y as i32,
+            src_u.as_ptr(),
+            src_stride_u as i32,
+            src_v.as_ptr(),
+            src_stride_v as i32,
+            dst_y.as_mut_ptr(),
+            dst_stride_y as i32,
+            dst_uv.as_mut_ptr(),
+            dst_stride_uv as i32,
+            width as i32,
+            height,
+        ) == 0
+    });
+}
+
 pub fn i422_to_raw(
     src_y: &[u8],
     src_stride_y: u32,
