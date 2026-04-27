@@ -460,6 +460,40 @@ pub unsafe fn cvt_i420(
             );
             Ok((dst, info))
         }
+        proto::VideoBufferType::Nv12 => {
+            // libvpx VP8/VP9 software decoders hand back I420; downstream
+            // consumers (e.g. our DRM display path) want NV12. Without this
+            // arm, video_stream's "convert to Nv12" call fell into the
+            // catch-all Err and the inbound video silently went black.
+            let chroma_w = (width + 1) / 2;
+            let chroma_h = (height + 1) / 2;
+            // NV12 UV is biplanar interleaved → byte stride = 2 * chroma_w.
+            // Same convention as cvt_nv12 above; keep them consistent so
+            // downstream ComponentInfo.size math lines up.
+            let chroma_stride = chroma_w * 2;
+            let mut dst =
+                vec![0u8; (width * height + chroma_w * chroma_h * 2) as usize].into_boxed_slice();
+            let (dst_y, dst_uv) = {
+                let (luma, chroma) = dst.split_at_mut((width * height) as usize);
+                (luma, chroma)
+            };
+
+            colorcvt::i420_to_nv12(
+                data_y, c0.stride, data_u, c1.stride, data_v, c2.stride, dst_y, width, dst_uv,
+                chroma_stride, width, height, flip_y,
+            );
+
+            let info = nv12_info(
+                dst_y.as_ptr(),
+                dst_y.as_ptr(),
+                dst_uv.as_ptr(),
+                width,
+                height,
+                width,
+                chroma_stride,
+            );
+            Ok((dst, info))
+        }
         _ => {
             return Err(FfiError::InvalidRequest(
                 format!("i420 to {:?} is not supported", dst_type).into(),

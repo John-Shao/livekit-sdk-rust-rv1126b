@@ -15,6 +15,8 @@
 #include "absl/strings/match.h"
 #include "media/base/media_constants.h"
 #include "modules/video_coding/codecs/h264/include/h264.h"
+#include "modules/video_coding/codecs/vp8/include/vp8.h"
+#include "modules/video_coding/codecs/vp9/include/vp9.h"
 #include "rtc_base/logging.h"
 
 // MppCodingType comes via rockchip_mpp_decoder.h's "rk_mpi.h" → "rk_type.h".
@@ -23,9 +25,9 @@ namespace webrtc {
 
 namespace {
 
-// SDP codec name → MPP coding type. Limited to codecs RV1126B's MPP
-// actually has decoder front-ends for; see the GetSupportedFormats note
-// for why VP8/VP9 aren't listed.
+// SDP codec name → MPP coding type, for the codecs RV1126B's MPP can
+// actually drive in hardware (AVC + HEVC). VP8/VP9 are intentionally
+// absent here — they go through the libvpx software path in Create().
 std::optional<MppCodingType> codecNameToMppCoding(const std::string &name) {
   if (absl::EqualsIgnoreCase(name, kH264CodecName)) {
     return MPP_VIDEO_CodingAVC;
@@ -59,22 +61,36 @@ bool RockchipMppVideoDecoderFactory::IsSupported() {
 }
 
 std::unique_ptr<VideoDecoder>
-RockchipMppVideoDecoderFactory::Create(const Environment & /*env*/,
+RockchipMppVideoDecoderFactory::Create(const Environment &env,
                                        const SdpVideoFormat &format) {
   std::string params;
   for (const auto &kv : format.parameters) {
     params += kv.first + "=" + kv.second + " ";
   }
+
+  // VP8 / VP9: peers (notably the LiveKit Android SDK) default to VP8
+  // for publish, and we can't drop the receive side because LiveKit
+  // doesn't transcode. Hand these off to libvpx's software decoder so
+  // the channel still delivers video — at the cost of some CPU. The
+  // hardware path stays for the codecs MPP can actually drive.
+  if (absl::EqualsIgnoreCase(format.name, kVp8CodecName)) {
+    std::fprintf(stderr, "[mpp-dec] Create(VP8 %s) → libvpx software\n",
+                 params.c_str());
+    return CreateVp8Decoder(env);
+  }
+  if (absl::EqualsIgnoreCase(format.name, kVp9CodecName)) {
+    std::fprintf(stderr, "[mpp-dec] Create(VP9 %s) → libvpx software\n",
+                 params.c_str());
+    return VP9Decoder::Create();
+  }
+
   std::optional<MppCodingType> coding = codecNameToMppCoding(format.name);
   if (!coding) {
-    // Shouldn't happen — libwebrtc only calls Create for formats we
-    // advertised. Bail loud so a vendor-side change to GetSupportedFormats
-    // can't silently produce a half-working decoder.
     std::fprintf(stderr, "[mpp-dec] Create(%s) unsupported name — refusing\n",
                  format.name.c_str());
     return nullptr;
   }
-  std::fprintf(stderr, "[mpp-dec] Create(%s %s) → coding=%d\n",
+  std::fprintf(stderr, "[mpp-dec] Create(%s %s) → MPP coding=%d\n",
                format.name.c_str(), params.c_str(),
                static_cast<int>(*coding));
   return std::make_unique<RockchipMppVideoDecoderImpl>(format, *coding);
@@ -84,11 +100,11 @@ std::vector<SdpVideoFormat>
 RockchipMppVideoDecoderFactory::GetSupportedFormats() const {
   std::vector<SdpVideoFormat> formats;
 
-  // ---- H.264 ----
+  // ---- H.264 (MPP hardware) ----
   // Full Constrained Baseline / Baseline / Main × packetization-mode 0/1
-  // matrix that RV1126B's hardware decoder can handle. profile-level-id
-  // matching is strict (IsSameCodec), so we list every flavour libwebrtc
-  // peers commonly negotiate.
+  // matrix the hardware decoder handles. profile-level-id matching is
+  // strict (IsSameCodec), so we list every flavour peers commonly
+  // negotiate rather than relying on the FFI's secondary match loop.
   static constexpr H264Profile kH264Profiles[] = {
       H264Profile::kProfileConstrainedBaseline,
       H264Profile::kProfileBaseline,
@@ -102,15 +118,21 @@ RockchipMppVideoDecoderFactory::GetSupportedFormats() const {
     }
   }
 
-  // ---- H.265 ----
-  // RV1126B's MPP only ships AVC + HEVC decoders ("unable to create dec
-  // vp8/vp9 for soc rv1126b unsupported" from libmpp). The MppCodingType
-  // enum lists VP8/VP9 because MPP is a generic API, but the per-SoC
-  // codec table on this chip stops at HEVC — so we only advertise the
-  // codecs we can actually serve. Without this gate the SDP negotiation
-  // happily picked VP8/VP9 from a peer that supports them, and inbound
-  // video silently went black.
+  // ---- H.265 (MPP hardware) ----
   formats.push_back(SdpVideoFormat::H265());
+
+  // ---- VP8 / VP9 (libvpx software fallback) ----
+  // RV1126B's MPP can't decode VP8/VP9 ("unable to create dec vp8/vp9
+  // for soc rv1126b unsupported" from libmpp), but advertising them
+  // anyway lets a peer that only publishes VP8/VP9 (LiveKit Android
+  // default) still deliver video — Create() routes these to libvpx.
+  // CPU cost: libvpx VP8 720p30 ≈ +30% on this single-core part; if a
+  // user wants the hardware fast path back, switch the publisher to
+  // H.264/H.265.
+  formats.push_back(SdpVideoFormat::VP8());
+  for (const auto &fmt : SupportedVP9DecoderCodecs()) {
+    formats.push_back(fmt);
+  }
 
   return formats;
 }
