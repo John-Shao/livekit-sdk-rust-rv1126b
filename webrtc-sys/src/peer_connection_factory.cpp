@@ -74,7 +74,21 @@ PeerConnectionFactory::PeerConnectionFactory(
       std::move(std::make_unique<livekit_ffi::VideoDecoderFactory>());
   dependencies.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
   dependencies.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
-  dependencies.audio_processing_builder = std::make_unique<webrtc::BuiltinAudioProcessingBuilder>();
+  // Disable AGC1 + AGC2 in the built-in APM. WebRTC's defaults turn both on,
+  // which silently undoes any explicit gain on the publish side: a captured
+  // signal already amplified to ~clipping (e.g. ES8389 board mic + 12×
+  // software gain) gets attenuated back down by AGC, so the remote peer
+  // hears something that sounds tinny / "from the earpiece" instead of full
+  // speaker volume. Also disable EC/NS/HPF — the board has no acoustic
+  // loopback to cancel and we'd rather pass through uncolored mic audio.
+  webrtc::AudioProcessing::Config apm_config;
+  apm_config.echo_canceller.enabled = false;
+  apm_config.gain_controller1.enabled = false;
+  apm_config.gain_controller2.enabled = false;
+  apm_config.high_pass_filter.enabled = false;
+  apm_config.noise_suppression.enabled = false;
+  dependencies.audio_processing_builder =
+      std::make_unique<webrtc::BuiltinAudioProcessingBuilder>(apm_config);
 
   webrtc::EnableMedia(dependencies);
   peer_factory_ =
