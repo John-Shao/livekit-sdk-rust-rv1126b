@@ -412,6 +412,37 @@ int RockchipMppH264EncoderImpl::initMppContext(int width, int height, int fps,
   mpp_enc_cfg_set_s32(cfg_, "prep:ver_stride", ver_stride_);
   mpp_enc_cfg_set_s32(cfg_, "prep:format", MPP_FMT_YUV420SP);
 
+  // Hardware rotation in the encoder pre-processing stage (zero CPU cost).
+  // ATK-DLRV1126B's stock camera is physically mounted at +90° relative
+  // to landscape, so default capture is sideways; rotate=1 (=90°) brings
+  // it back to natural. MppEncRotationCfg: 0/1/2/3 = 0/90/180/270.
+  // BOARD_LOOPBACK_VIDEO_ROTATE env: literal degrees (0/90/180/270).
+  //
+  // Doing rotation in the encoder rather than at the source side via
+  // VideoFrame::rotation / RTP extension because the latter requires the
+  // receiver's RTP stack to honor urn:3gpp:video-orientation — which the
+  // current LiveKit Mobile app on this user's setup doesn't (the rotation
+  // flag silently no-ops on the receive side). MPP-rotated bitstream is
+  // already upright when it lands on the wire, no receiver cooperation
+  // needed.
+  int rotation_cfg = 0;
+  if (const char *rot_env = std::getenv("BOARD_LOOPBACK_VIDEO_ROTATE")) {
+    int deg = std::atoi(rot_env);
+    if (deg == 90)       rotation_cfg = 1;
+    else if (deg == 180) rotation_cfg = 2;
+    else if (deg == 270) rotation_cfg = 3;
+    else if (deg != 0) {
+      RTC_LOG(LS_WARNING)
+          << "[mpp] invalid BOARD_LOOPBACK_VIDEO_ROTATE=" << deg
+          << " (must be 0/90/180/270), defaulting to 0";
+    }
+  }
+  if (rotation_cfg) {
+    mpp_enc_cfg_set_s32(cfg_, "prep:rotation", rotation_cfg);
+    RTC_LOG(LS_INFO) << "[mpp] encoder hardware rotation = " << rotation_cfg
+                     << " (" << (rotation_cfg * 90) << " deg)";
+  }
+
   // Rate control — CBR keyed off WebRTC's startBitrate.
   mpp_enc_cfg_set_s32(cfg_, "rc:mode", MPP_ENC_RC_MODE_CBR);
   mpp_enc_cfg_set_s32(cfg_, "rc:bps_target", target_bps);
