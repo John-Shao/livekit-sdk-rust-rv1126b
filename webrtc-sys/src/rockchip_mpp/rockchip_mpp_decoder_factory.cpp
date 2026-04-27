@@ -23,21 +23,15 @@ namespace webrtc {
 
 namespace {
 
-// SDP codec name → MPP coding type. Returned as optional so Create() can
-// fall through to nullptr (libwebrtc then picks a software fallback) for
-// formats we mistakenly advertise but can't build a coder for.
+// SDP codec name → MPP coding type. Limited to codecs RV1126B's MPP
+// actually has decoder front-ends for; see the GetSupportedFormats note
+// for why VP8/VP9 aren't listed.
 std::optional<MppCodingType> codecNameToMppCoding(const std::string &name) {
   if (absl::EqualsIgnoreCase(name, kH264CodecName)) {
     return MPP_VIDEO_CodingAVC;
   }
   if (absl::EqualsIgnoreCase(name, kH265CodecName)) {
     return MPP_VIDEO_CodingHEVC;
-  }
-  if (absl::EqualsIgnoreCase(name, kVp8CodecName)) {
-    return MPP_VIDEO_CodingVP8;
-  }
-  if (absl::EqualsIgnoreCase(name, kVp9CodecName)) {
-    return MPP_VIDEO_CodingVP9;
   }
   return std::nullopt;
 }
@@ -108,15 +102,15 @@ RockchipMppVideoDecoderFactory::GetSupportedFormats() const {
     }
   }
 
-  // ---- H.265 / VP8 / VP9 ----
-  // Phase 6.4: advertise the rest of the codecs MPP can decode in hardware
-  // so the SDP negotiation doesn't force the publisher into H.264. The
-  // SdpVideoFormat::Hxxx() / VPx() statics give the canonical fmtp strings
-  // the rest of libwebrtc uses internally; using them keeps the negotiation
-  // matching predictable.
+  // ---- H.265 ----
+  // RV1126B's MPP only ships AVC + HEVC decoders ("unable to create dec
+  // vp8/vp9 for soc rv1126b unsupported" from libmpp). The MppCodingType
+  // enum lists VP8/VP9 because MPP is a generic API, but the per-SoC
+  // codec table on this chip stops at HEVC — so we only advertise the
+  // codecs we can actually serve. Without this gate the SDP negotiation
+  // happily picked VP8/VP9 from a peer that supports them, and inbound
+  // video silently went black.
   formats.push_back(SdpVideoFormat::H265());
-  formats.push_back(SdpVideoFormat::VP8());
-  formats.push_back(SdpVideoFormat::VP9Profile0());
 
   return formats;
 }
