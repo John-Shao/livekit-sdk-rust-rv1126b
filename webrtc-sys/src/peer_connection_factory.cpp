@@ -16,7 +16,9 @@
 
 #include "livekit/peer_connection_factory.h"
 
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
@@ -74,19 +76,46 @@ PeerConnectionFactory::PeerConnectionFactory(
       std::move(std::make_unique<livekit_ffi::VideoDecoderFactory>());
   dependencies.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
   dependencies.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
-  // Disable AGC1 + AGC2 in the built-in APM. WebRTC's defaults turn both on,
-  // which silently undoes any explicit gain on the publish side: a captured
-  // signal already amplified to ~clipping (e.g. ES8389 board mic + 12×
-  // software gain) gets attenuated back down by AGC, so the remote peer
-  // hears something that sounds tinny / "from the earpiece" instead of full
-  // speaker volume. Also disable EC/NS/HPF — the board has no acoustic
-  // loopback to cancel and we'd rather pass through uncolored mic audio.
+  // APM module gating — four concerns to balance, each disabled for a
+  // specific reason on this board:
+  //
+  //   AGC1/AGC2: off. WebRTC's defaults turn both on, which silently undoes
+  //     any explicit publish-side gain. The board's path is calibrated
+  //     ES8389 PGA = +27 dB (numid=39/40 ALSA mixer) → 8× software gain in
+  //     BoardLoopback → ~clipping; AGC then attenuates that right back down
+  //     and the remote hears tinny "from the earpiece" audio.
+  //
+  //   AEC: off. AEC3 / AEC-mobile both need a "reverse stream" — a copy of
+  //     the audio being played out the local speaker — so they can subtract
+  //     it from the mic signal. The reverse stream is fed in by the SDK's
+  //     ADM render side. BoardLoopback bypasses ADM playback entirely
+  //     (custom AudioStream callback → ALSA writer thread), so APM never
+  //     gets a reverse stream and AEC silently mis-fires: it treats every
+  //     captured signal as undefined interference and attenuates voice
+  //     instead of canceling echo. Real fix is wiring playback back through
+  //     ADM, which is a larger refactor than Phase 7.2 — punted for now.
+  //
+  //   NS: on at kVeryHigh. Capture-side only, no reverse stream needed.
+  //     Default kModerate is too gentle to be audible against ambient board
+  //     fan / desk noise; kVeryHigh gives a clearly perceptible reduction.
+  //
+  //   HPF: on. Cuts < 80 Hz rumble (room HVAC, fan harmonics). Cheap and
+  //     uncontroversial for voice.
+  //
+  //   Env escape hatch: BOARD_LOOPBACK_APM_OFF=1 disables NS+HPF too,
+  //     reverting to Phase 6.3 fully-passthrough capture for A/B testing.
   webrtc::AudioProcessing::Config apm_config;
-  apm_config.echo_canceller.enabled = false;
+  const char *apm_off = std::getenv("BOARD_LOOPBACK_APM_OFF");
+  bool full_off = apm_off && std::string(apm_off) == "1";
   apm_config.gain_controller1.enabled = false;
   apm_config.gain_controller2.enabled = false;
-  apm_config.high_pass_filter.enabled = false;
-  apm_config.noise_suppression.enabled = false;
+  apm_config.echo_canceller.enabled = false;
+  apm_config.noise_suppression.enabled = !full_off;
+  apm_config.noise_suppression.level =
+      webrtc::AudioProcessing::Config::NoiseSuppression::kVeryHigh;
+  apm_config.high_pass_filter.enabled = !full_off;
+  RTC_LOG(LS_INFO) << "[apm] cfg: AEC=0 NS=" << !full_off
+                   << "(VeryHigh) HPF=" << !full_off << " AGC1=0 AGC2=0";
   dependencies.audio_processing_builder =
       std::make_unique<webrtc::BuiltinAudioProcessingBuilder>(apm_config);
 
