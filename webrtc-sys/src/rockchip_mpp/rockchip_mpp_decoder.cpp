@@ -21,6 +21,7 @@
 #include "rockchip_mpp_decoder.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <thread>
 
@@ -49,12 +50,15 @@ bool RockchipMppH264DecoderImpl::Configure(const Settings & /*settings*/) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (initialized_)
     return true;
+  std::fprintf(stderr, "[mpp-dec] Configure() — opening MPP context\n");
   int rc = initMppContext();
   if (rc != 0) {
+    std::fprintf(stderr, "[mpp-dec] initMppContext failed rc=%d\n", rc);
     RTC_LOG(LS_ERROR) << "[mpp-dec] initMppContext failed: " << rc;
     teardownMppContext();
     return false;
   }
+  std::fprintf(stderr, "[mpp-dec] Configure OK\n");
   initialized_ = true;
   return true;
 }
@@ -88,6 +92,14 @@ int32_t RockchipMppH264DecoderImpl::Decode(const EncodedImage &input_image,
   }
   if (!input_image.data() || input_image.size() == 0) {
     return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+  }
+  // Log first packet only — subsequent packets at WebRTC ingress rate
+  // (~30/s) would flood stderr.
+  static thread_local bool logged_first_decode = false;
+  if (!logged_first_decode) {
+    std::fprintf(stderr, "[mpp-dec] Decode() first packet size=%zu bytes\n",
+                 input_image.size());
+    logged_first_decode = true;
   }
 
   // 1. Wrap the inbound bitstream in our reusable MppPacket. The buffer
