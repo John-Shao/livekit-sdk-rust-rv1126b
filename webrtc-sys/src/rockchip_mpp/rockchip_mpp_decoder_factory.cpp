@@ -8,13 +8,41 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
+#include <string>
 #include <sys/stat.h>
 
+#include "absl/strings/match.h"
 #include "media/base/media_constants.h"
 #include "modules/video_coding/codecs/h264/include/h264.h"
 #include "rtc_base/logging.h"
 
+// MppCodingType comes via rockchip_mpp_decoder.h's "rk_mpi.h" → "rk_type.h".
+
 namespace webrtc {
+
+namespace {
+
+// SDP codec name → MPP coding type. Returned as optional so Create() can
+// fall through to nullptr (libwebrtc then picks a software fallback) for
+// formats we mistakenly advertise but can't build a coder for.
+std::optional<MppCodingType> codecNameToMppCoding(const std::string &name) {
+  if (absl::EqualsIgnoreCase(name, kH264CodecName)) {
+    return MPP_VIDEO_CodingAVC;
+  }
+  if (absl::EqualsIgnoreCase(name, kH265CodecName)) {
+    return MPP_VIDEO_CodingHEVC;
+  }
+  if (absl::EqualsIgnoreCase(name, kVp8CodecName)) {
+    return MPP_VIDEO_CodingVP8;
+  }
+  if (absl::EqualsIgnoreCase(name, kVp9CodecName)) {
+    return MPP_VIDEO_CodingVP9;
+  }
+  return std::nullopt;
+}
+
+} // namespace
 
 RockchipMppVideoDecoderFactory::RockchipMppVideoDecoderFactory() {
   RTC_LOG(LS_INFO) << "[mpp-dec] RockchipMppVideoDecoderFactory ctor";
@@ -39,42 +67,57 @@ bool RockchipMppVideoDecoderFactory::IsSupported() {
 std::unique_ptr<VideoDecoder>
 RockchipMppVideoDecoderFactory::Create(const Environment & /*env*/,
                                        const SdpVideoFormat &format) {
-  // Once-per-stream stderr trace — confirms we beat OpenH264 in the FFI's
-  // factory selection. RTC_LOG isn't routed to stdout in this build, so
-  // stderr is the only place ops can grep for hardware-codec activation.
   std::string params;
   for (const auto &kv : format.parameters) {
     params += kv.first + "=" + kv.second + " ";
   }
-  std::fprintf(stderr, "[mpp-dec] Create(%s %s)\n", format.name.c_str(),
-               params.c_str());
-  return std::make_unique<RockchipMppH264DecoderImpl>(format);
+  std::optional<MppCodingType> coding = codecNameToMppCoding(format.name);
+  if (!coding) {
+    // Shouldn't happen — libwebrtc only calls Create for formats we
+    // advertised. Bail loud so a vendor-side change to GetSupportedFormats
+    // can't silently produce a half-working decoder.
+    std::fprintf(stderr, "[mpp-dec] Create(%s) unsupported name — refusing\n",
+                 format.name.c_str());
+    return nullptr;
+  }
+  std::fprintf(stderr, "[mpp-dec] Create(%s %s) → coding=%d\n",
+               format.name.c_str(), params.c_str(),
+               static_cast<int>(*coding));
+  return std::make_unique<RockchipMppVideoDecoderImpl>(format, *coding);
 }
 
 std::vector<SdpVideoFormat>
 RockchipMppVideoDecoderFactory::GetSupportedFormats() const {
   std::vector<SdpVideoFormat> formats;
-  // Advertise the full H.264 profile × packetization-mode matrix that
-  // RV1126B's hardware decoder can handle (Baseline / Main / High up to
-  // 4K@60 per Rockchip docs). Level 3.1 is plenty for 720p30; we use the
-  // same level here so the SDP fmtp string parses consistently with the
-  // encoder side. libwebrtc clients commonly negotiate {Constrained
-  // Baseline, Baseline, Main} × {packetization-mode 0, 1}, so cover all
-  // six explicitly — the FFI's secondary match loop in
-  // video_decoder_factory.cpp can already absorb packetization-mode
-  // mismatches, but matching profile-level-id is strict (IsSameCodec).
-  static constexpr H264Profile kProfiles[] = {
+
+  // ---- H.264 ----
+  // Full Constrained Baseline / Baseline / Main × packetization-mode 0/1
+  // matrix that RV1126B's hardware decoder can handle. profile-level-id
+  // matching is strict (IsSameCodec), so we list every flavour libwebrtc
+  // peers commonly negotiate.
+  static constexpr H264Profile kH264Profiles[] = {
       H264Profile::kProfileConstrainedBaseline,
       H264Profile::kProfileBaseline,
       H264Profile::kProfileMain,
   };
-  for (auto profile : kProfiles) {
+  for (auto profile : kH264Profiles) {
     for (const char *pkt_mode : {"1", "0"}) {
       formats.push_back(CreateH264Format(profile, H264Level::kLevel3_1,
                                          pkt_mode,
                                          /*add_scalability_modes=*/false));
     }
   }
+
+  // ---- H.265 / VP8 / VP9 ----
+  // Phase 6.4: advertise the rest of the codecs MPP can decode in hardware
+  // so the SDP negotiation doesn't force the publisher into H.264. The
+  // SdpVideoFormat::Hxxx() / VPx() statics give the canonical fmtp strings
+  // the rest of libwebrtc uses internally; using them keeps the negotiation
+  // matching predictable.
+  formats.push_back(SdpVideoFormat::H265());
+  formats.push_back(SdpVideoFormat::VP8());
+  formats.push_back(SdpVideoFormat::VP9Profile0());
+
   return formats;
 }
 
