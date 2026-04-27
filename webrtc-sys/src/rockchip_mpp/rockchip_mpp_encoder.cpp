@@ -2,16 +2,19 @@
  * Copyright 2026 LiveKit
  * Licensed under the Apache License, Version 2.0.
  *
- * Phase 6.1.4 — real Rockchip MPP H.264 encode path:
- *   InitEncode  : mpp_create + mpp_init(MPP_CTX_ENC, AVC) + MppEncCfg
- *                 (size/fmt=NV12/fps/rc=cbr/bps/gop) + DRM buffer group
- *                 + sps/pps cached via MPP_ENC_GET_HDR_SYNC
+ * Codec-generic Rockchip MPP encoder (AVC + HEVC). Pipeline shape is
+ * identical across codecs:
+ *   InitEncode  : mpp_create + mpp_init(MPP_CTX_ENC, coding_) + MppEncCfg
+ *                 (size/fmt=NV12/fps/rc=cbr/bps/gop + codec-specific cfg
+ *                 keys) + DRM buffer group + parameter sets cached via
+ *                 MPP_ENC_GET_HDR_SYNC (SPS+PPS for AVC, VPS+SPS+PPS
+ *                 for HEVC).
  *   Encode      : I420 → NV12 software convert into MppBuffer →
  *                 encode_put_frame → encode_get_packet → EncodedImage →
- *                 OnEncodedImage(). SPS/PPS prepended on each IDR.
+ *                 OnEncodedImage(). Parameter sets prepended on each IDR.
  *   SetRates    : forwards bps_target/fps to MPP via MPP_ENC_SET_CFG.
  *
- * RGA zero-copy + simulcast → Phase 6.1.5. Decoder → Phase 6.2.
+ * RGA zero-copy + simulcast → later phases.
  */
 
 // MODULE_TAG must be defined BEFORE including mpp_buffer.h — its
@@ -22,9 +25,11 @@
 #include "rockchip_mpp_encoder.h"
 
 #include <cstring>
+#include <string>
 
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame_buffer.h"
+#include "api/array_view.h"
 #include "modules/video_coding/codecs/h264/include/h264_globals.h"
 #include "modules/video_coding/include/video_codec_interface.h"
 #include "modules/video_coding/include/video_error_codes.h"
@@ -64,38 +69,80 @@ void I420ToNV12(const uint8_t *src_y, int src_stride_y, const uint8_t *src_u,
                        width, height);
 }
 
-// Look at the first NAL unit header to decide if a packet starts with an
-// IDR. RV1126B emits Annex-B (00 00 00 01 / 00 00 01) start codes.
-bool PacketStartsWithIdr(const uint8_t *data, size_t len) {
-  if (len < 5)
-    return false;
-  size_t i = 0;
-  // Skip start code
-  if (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) {
-    i = 4;
-  } else if (data[0] == 0 && data[1] == 0 && data[2] == 1) {
-    i = 3;
-  } else {
-    return false;
+const char *codingTypeName(MppCodingType c) {
+  switch (c) {
+    case MPP_VIDEO_CodingAVC:  return "H264";
+    case MPP_VIDEO_CodingHEVC: return "H265";
+    default:                   return "Unknown";
   }
-  if (i >= len)
-    return false;
-  uint8_t nal_type = data[i] & 0x1F;
-  // 5 = IDR slice; 7 = SPS; 8 = PPS — both bracket IDR for keyframe payloads.
+}
+
+// Skip the Annex-B start code (00 00 00 01 / 00 00 01) at `data` and
+// return the offset of the first NAL unit header byte; SIZE_MAX if no
+// start code is present or `len` is too short. Both AVC and HEVC use the
+// same Annex-B framing.
+size_t SkipStartCode(const uint8_t *data, size_t len) {
+  if (len < 4) return SIZE_MAX;
+  if (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
+    return 4;
+  if (data[0] == 0 && data[1] == 0 && data[2] == 1)
+    return 3;
+  return SIZE_MAX;
+}
+
+// AVC NAL types we treat as "this packet leads a keyframe access unit":
+// 5 = IDR slice; 7 = SPS; 8 = PPS — MPP can emit any of these first.
+bool AvcNalStartsKeyframe(uint8_t header_byte) {
+  uint8_t nal_type = header_byte & 0x1F;
   return nal_type == 5 || nal_type == 7 || nal_type == 8;
+}
+
+// HEVC NAL type is bits [6:1] of the first header byte (NAL unit type
+// field, T-REC H.265 §7.3.1.2). Keyframe leaders:
+//   16-21 = BLA_*/IDR_W_RADL(19)/IDR_N_LP(20)/CRA(21) — IRAP slices
+//   32 = VPS, 33 = SPS, 34 = PPS — parameter sets MPP often emits first
+bool HevcNalStartsKeyframe(uint8_t header_byte) {
+  uint8_t nal_type = (header_byte >> 1) & 0x3F;
+  return (nal_type >= 16 && nal_type <= 21) ||
+         nal_type == 32 || nal_type == 33 || nal_type == 34;
+}
+
+bool PacketStartsWithIdr(const uint8_t *data, size_t len, MppCodingType coding) {
+  size_t i = SkipStartCode(data, len);
+  if (i == SIZE_MAX || i >= len)
+    return false;
+  return coding == MPP_VIDEO_CodingHEVC ? HevcNalStartsKeyframe(data[i])
+                                        : AvcNalStartsKeyframe(data[i]);
+}
+
+// "Did MPP already prepend a parameter-set NAL ahead of the IDR slice?"
+// — used to avoid double-prepending our cached header on packets where
+// the encoder already emitted the parameter sets inline.
+bool PacketStartsWithParamSet(const uint8_t *data, size_t len,
+                              MppCodingType coding) {
+  size_t i = SkipStartCode(data, len);
+  if (i == SIZE_MAX || i >= len)
+    return false;
+  uint8_t b = data[i];
+  if (coding == MPP_VIDEO_CodingHEVC) {
+    uint8_t nal_type = (b >> 1) & 0x3F;
+    return nal_type == 32 || nal_type == 33 || nal_type == 34; // VPS/SPS/PPS
+  }
+  uint8_t nal_type = b & 0x1F;
+  return nal_type == 7 || nal_type == 8; // SPS/PPS
 }
 
 } // namespace
 
-RockchipMppH264EncoderImpl::RockchipMppH264EncoderImpl(
-    const SdpVideoFormat &format)
-    : format_(format) {
-  RTC_LOG(LS_INFO) << "[mpp] RockchipMppH264EncoderImpl ctor";
+RockchipMppVideoEncoderImpl::RockchipMppVideoEncoderImpl(
+    const SdpVideoFormat &format, MppCodingType coding)
+    : format_(format), coding_(coding) {
+  RTC_LOG(LS_INFO) << "[mpp-enc] ctor codec=" << codingTypeName(coding_);
 }
 
-RockchipMppH264EncoderImpl::~RockchipMppH264EncoderImpl() { Release(); }
+RockchipMppVideoEncoderImpl::~RockchipMppVideoEncoderImpl() { Release(); }
 
-int RockchipMppH264EncoderImpl::InitEncode(const VideoCodec *codec_settings,
+int RockchipMppVideoEncoderImpl::InitEncode(const VideoCodec *codec_settings,
                                            const Settings & /*settings*/) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!codec_settings) {
@@ -124,7 +171,7 @@ int RockchipMppH264EncoderImpl::InitEncode(const VideoCodec *codec_settings,
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-int RockchipMppH264EncoderImpl::Release() {
+int RockchipMppVideoEncoderImpl::Release() {
   std::lock_guard<std::mutex> lock(mutex_);
   if (initialized_) {
     teardownMppContext();
@@ -134,14 +181,14 @@ int RockchipMppH264EncoderImpl::Release() {
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-int RockchipMppH264EncoderImpl::RegisterEncodeCompleteCallback(
+int RockchipMppVideoEncoderImpl::RegisterEncodeCompleteCallback(
     EncodedImageCallback *callback) {
   std::lock_guard<std::mutex> lock(mutex_);
   encoded_callback_ = callback;
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-int RockchipMppH264EncoderImpl::Encode(
+int RockchipMppVideoEncoderImpl::Encode(
     const VideoFrame &frame,
     const std::vector<VideoFrameType> *frame_types) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -248,25 +295,20 @@ int RockchipMppH264EncoderImpl::Encode(
     }
   }
   if (!is_idr) {
-    is_idr = PacketStartsWithIdr(pkt_pos, pkt_len) || want_keyframe;
+    is_idr = PacketStartsWithIdr(pkt_pos, pkt_len, coding_) || want_keyframe;
   }
 
-  // 7. Build EncodedImage. Prepend cached SPS/PPS on every IDR — libwebrtc's
-  //    H.264 RTP packetizer / depacketizer expects IDR access units to
-  //    carry their parameter sets so a late-joining receiver can decode.
+  // 7. Build EncodedImage. Prepend cached parameter sets on every IDR —
+  //    libwebrtc's H.264/H.265 RTP packetizer / depacketizer expects IDR
+  //    access units to carry their parameter sets so a late-joining
+  //    receiver can decode. SPS+PPS for H.264; VPS+SPS+PPS for H.265 —
+  //    same blob, just whatever MPP_ENC_GET_HDR_SYNC handed back.
   std::vector<uint8_t> payload;
   payload.reserve(pkt_len + (is_idr ? hdr_pps_sps_.size() : 0));
   if (is_idr && !hdr_pps_sps_.empty() && pkt_len > 4) {
-    // Avoid double-prepending if MPP already emitted SPS/PPS in front of IDR.
-    bool already_has_sps = false;
-    if (pkt_len >= 5) {
-      size_t i = (pkt_pos[2] == 1) ? 3 : 4;
-      if (i < pkt_len) {
-        uint8_t nal = pkt_pos[i] & 0x1F;
-        already_has_sps = (nal == 7 || nal == 8);
-      }
-    }
-    if (!already_has_sps) {
+    bool already_has_param_set =
+        PacketStartsWithParamSet(pkt_pos, pkt_len, coding_);
+    if (!already_has_param_set) {
       payload.insert(payload.end(), hdr_pps_sps_.begin(), hdr_pps_sps_.end());
     }
   }
@@ -283,18 +325,34 @@ int RockchipMppH264EncoderImpl::Encode(
                               : VideoFrameType::kVideoFrameDelta;
 
   // Parse to populate qp_ for stats / pacer (best-effort; ignore failures).
-  h264_parser_.ParseBitstream(encoded);
-  if (auto qp_opt = h264_parser_.GetLastSliceQp()) {
-    encoded.qp_ = *qp_opt;
+  // Codec-specific parser; the unused one stays untouched.
+  if (coding_ == MPP_VIDEO_CodingHEVC) {
+    h265_parser_.ParseBitstream(
+        ArrayView<const uint8_t>(payload.data(), payload.size()));
+    if (auto qp_opt = h265_parser_.GetLastSliceQp()) {
+      encoded.qp_ = *qp_opt;
+    }
+  } else {
+    h264_parser_.ParseBitstream(encoded);
+    if (auto qp_opt = h264_parser_.GetLastSliceQp()) {
+      encoded.qp_ = *qp_opt;
+    }
   }
 
   CodecSpecificInfo codec_specific;
-  codec_specific.codecType = kVideoCodecH264;
-  codec_specific.codecSpecific.H264.packetization_mode =
-      H264PacketizationMode::NonInterleaved;
-  codec_specific.codecSpecific.H264.idr_frame = is_idr;
-  codec_specific.codecSpecific.H264.base_layer_sync = false;
-  codec_specific.codecSpecific.H264.temporal_idx = kNoTemporalIdx;
+  if (coding_ == MPP_VIDEO_CodingHEVC) {
+    // libwebrtc's CodecSpecificInfoUnion in this prebuilt has no H265
+    // member — H.265 RTP packetizer reads what it needs straight off
+    // the bitstream. Only codecType is required.
+    codec_specific.codecType = kVideoCodecH265;
+  } else {
+    codec_specific.codecType = kVideoCodecH264;
+    codec_specific.codecSpecific.H264.packetization_mode =
+        H264PacketizationMode::NonInterleaved;
+    codec_specific.codecSpecific.H264.idr_frame = is_idr;
+    codec_specific.codecSpecific.H264.base_layer_sync = false;
+    codec_specific.codecSpecific.H264.temporal_idx = kNoTemporalIdx;
+  }
 
   EncodedImageCallback::Result cb_result =
       encoded_callback_->OnEncodedImage(encoded, &codec_specific);
@@ -311,7 +369,7 @@ int RockchipMppH264EncoderImpl::Encode(
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-void RockchipMppH264EncoderImpl::SetRates(
+void RockchipMppVideoEncoderImpl::SetRates(
     const RateControlParameters &parameters) {
   std::lock_guard<std::mutex> lock(mutex_);
   int new_bps = static_cast<int>(parameters.bitrate.get_sum_bps());
@@ -337,9 +395,10 @@ void RockchipMppH264EncoderImpl::SetRates(
 }
 
 VideoEncoder::EncoderInfo
-RockchipMppH264EncoderImpl::GetEncoderInfo() const {
+RockchipMppVideoEncoderImpl::GetEncoderInfo() const {
   EncoderInfo info;
-  info.implementation_name = "RockchipMpp_H264";
+  info.implementation_name =
+      std::string("RockchipMpp_") + codingTypeName(coding_);
   info.is_hardware_accelerated = true;
   info.supports_native_handle = false;
   info.supports_simulcast = false;
@@ -348,7 +407,7 @@ RockchipMppH264EncoderImpl::GetEncoderInfo() const {
 
 // ---- private helpers ---------------------------------------------------
 
-int RockchipMppH264EncoderImpl::initMppContext(int width, int height, int fps,
+int RockchipMppVideoEncoderImpl::initMppContext(int width, int height, int fps,
                                                int target_bps, int gop_len) {
   // 1. Allocate DRM buffer group + reusable input/output buffers.
   //    Frame size for NV12 = hor_stride * ver_stride * 3/2.
@@ -386,10 +445,11 @@ int RockchipMppH264EncoderImpl::initMppContext(int width, int height, int fps,
     return ret;
   }
 
-  // 4. Initialize encoder for AVC.
-  ret = mpp_init(mpp_ctx_, MPP_CTX_ENC, MPP_VIDEO_CodingAVC);
+  // 4. Initialize encoder for the configured codec.
+  ret = mpp_init(mpp_ctx_, MPP_CTX_ENC, coding_);
   if (ret) {
-    RTC_LOG(LS_ERROR) << "[mpp] mpp_init(ENC, AVC) failed: " << ret;
+    RTC_LOG(LS_ERROR) << "[mpp] mpp_init(ENC, " << codingTypeName(coding_)
+                      << ") failed: " << ret;
     return ret;
   }
 
@@ -456,19 +516,36 @@ int RockchipMppH264EncoderImpl::initMppContext(int width, int height, int fps,
   mpp_enc_cfg_set_s32(cfg_, "rc:fps_out_denom", 1);
   mpp_enc_cfg_set_s32(cfg_, "rc:gop", gop_len);
 
-  // H.264-specific — Constrained Baseline (66) for max compatibility,
-  // disable CABAC for low-latency, init QP via CBR engine.
-  mpp_enc_cfg_set_s32(cfg_, "codec:type", MPP_VIDEO_CodingAVC);
-  mpp_enc_cfg_set_s32(cfg_, "h264:profile", 66);
-  mpp_enc_cfg_set_s32(cfg_, "h264:level", 31);
-  mpp_enc_cfg_set_s32(cfg_, "h264:cabac_en", 0);
-  mpp_enc_cfg_set_s32(cfg_, "h264:cabac_idc", 0);
-  mpp_enc_cfg_set_s32(cfg_, "h264:trans8x8", 0);
-  mpp_enc_cfg_set_s32(cfg_, "h264:qp_init", 26);
-  mpp_enc_cfg_set_s32(cfg_, "h264:qp_max", 51);
-  mpp_enc_cfg_set_s32(cfg_, "h264:qp_min", 10);
-  mpp_enc_cfg_set_s32(cfg_, "h264:qp_max_i", 46);
-  mpp_enc_cfg_set_s32(cfg_, "h264:qp_min_i", 18);
+  // Codec-specific cfg.
+  mpp_enc_cfg_set_s32(cfg_, "codec:type", coding_);
+  if (coding_ == MPP_VIDEO_CodingAVC) {
+    // H.264 — Constrained Baseline (66) for max compatibility, CABAC off
+    // for low-latency, init QP via CBR engine.
+    mpp_enc_cfg_set_s32(cfg_, "h264:profile", 66);
+    mpp_enc_cfg_set_s32(cfg_, "h264:level", 31);
+    mpp_enc_cfg_set_s32(cfg_, "h264:cabac_en", 0);
+    mpp_enc_cfg_set_s32(cfg_, "h264:cabac_idc", 0);
+    mpp_enc_cfg_set_s32(cfg_, "h264:trans8x8", 0);
+    mpp_enc_cfg_set_s32(cfg_, "h264:qp_init", 26);
+    mpp_enc_cfg_set_s32(cfg_, "h264:qp_max", 51);
+    mpp_enc_cfg_set_s32(cfg_, "h264:qp_min", 10);
+    mpp_enc_cfg_set_s32(cfg_, "h264:qp_max_i", 46);
+    mpp_enc_cfg_set_s32(cfg_, "h264:qp_min_i", 18);
+  } else if (coding_ == MPP_VIDEO_CodingHEVC) {
+    // H.265 — Main profile, Tier 0 (high tier wastes RC headroom we don't
+    // need for video conferencing), Level 3.1 (covers 720p30; matches the
+    // SDP advert in the factory). HEVC uses the same QP scale (0-51) as
+    // AVC, so init/max/min mirror the AVC values; tighter bounds aren't
+    // worth the regression risk on this first H.265 path.
+    mpp_enc_cfg_set_s32(cfg_, "h265:profile", 0);  // Main
+    mpp_enc_cfg_set_s32(cfg_, "h265:tier", 0);     // Tier 0
+    mpp_enc_cfg_set_s32(cfg_, "h265:level", 93);   // Level 3.1
+    mpp_enc_cfg_set_s32(cfg_, "h265:qp_init", 26);
+    mpp_enc_cfg_set_s32(cfg_, "h265:qp_max", 51);
+    mpp_enc_cfg_set_s32(cfg_, "h265:qp_min", 10);
+    mpp_enc_cfg_set_s32(cfg_, "h265:qp_max_i", 46);
+    mpp_enc_cfg_set_s32(cfg_, "h265:qp_min_i", 18);
+  }
 
   ret = mpp_api_->control(mpp_ctx_, MPP_ENC_SET_CFG, cfg_);
   if (ret) {
@@ -498,7 +575,7 @@ int RockchipMppH264EncoderImpl::initMppContext(int width, int height, int fps,
   return 0;
 }
 
-int RockchipMppH264EncoderImpl::applyRateControl() {
+int RockchipMppVideoEncoderImpl::applyRateControl() {
   if (!cfg_ || !mpp_api_ || !mpp_ctx_)
     return -1;
   mpp_enc_cfg_set_s32(cfg_, "rc:bps_target", target_bps_);
@@ -509,7 +586,7 @@ int RockchipMppH264EncoderImpl::applyRateControl() {
   return mpp_api_->control(mpp_ctx_, MPP_ENC_SET_CFG, cfg_);
 }
 
-void RockchipMppH264EncoderImpl::teardownMppContext() {
+void RockchipMppVideoEncoderImpl::teardownMppContext() {
   if (mpp_ctx_) {
     mpp_destroy(mpp_ctx_);
     mpp_ctx_ = nullptr;

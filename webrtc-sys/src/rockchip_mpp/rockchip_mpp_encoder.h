@@ -3,15 +3,16 @@
  *
  * Licensed under the Apache License, Version 2.0.
  *
- * Rockchip MPP (Media Process Platform) hardware H.264 encoder for
- * RV1126B-class SoCs. Wraps librockchip_mpp's MppCtx + MppApi over
- * webrtc::VideoEncoder so libwebrtc's encoder selection picks it
- * up via RockchipMppVideoEncoderFactory.
+ * Rockchip MPP (Media Process Platform) hardware video encoder for
+ * RV1126B-class SoCs. Codec-generic — same class drives H.264 (AVC)
+ * and H.265 (HEVC) encode pipelines on this SoC; coding is selected
+ * by the factory via the constructor's MppCodingType. Wraps
+ * librockchip_mpp's MppCtx + MppApi over webrtc::VideoEncoder so
+ * libwebrtc's encoder selection picks it up via the factory.
  *
- * Phase 6.1.4: real init + encode loop. I420 frames from the SDK get
- * software-converted to NV12 into an MppBuffer, fed via encode_put_frame,
- * the resulting H.264 NAL is pulled via encode_get_packet and shipped
- * upstream as an EncodedImage. RGA zero-copy is Phase 6.1.5.
+ * Phase 6.1.4: real H.264 encode path landed (I420→NV12 + put_frame /
+ * get_packet). Phase 7 generalizes the same loop to HEVC by branching
+ * codec-specific MppEncCfg keys + IDR/parameter-set NAL detection.
  */
 
 #ifndef WEBRTC_ROCKCHIP_MPP_ENCODER_IMPL_H_
@@ -28,6 +29,7 @@
 #include "api/video_codecs/sdp_video_format.h"
 #include "api/video_codecs/video_encoder.h"
 #include "common_video/h264/h264_bitstream_parser.h"
+#include "common_video/h265/h265_bitstream_parser.h"
 
 // MPP API headers — provided by SDK external/mpp/inc/, made visible by
 // build.rs adding ROCKCHIP_MPP_INCLUDE to the include path. Pull in
@@ -44,10 +46,14 @@ extern "C" {
 
 namespace webrtc {
 
-class RockchipMppH264EncoderImpl : public VideoEncoder {
+class RockchipMppVideoEncoderImpl : public VideoEncoder {
 public:
-  explicit RockchipMppH264EncoderImpl(const SdpVideoFormat &format);
-  ~RockchipMppH264EncoderImpl() override;
+  // `coding` selects the MPP encode pipeline (MPP_VIDEO_CodingAVC or
+  // CodingHEVC). Caller (factory) maps SDP codec name → MppCodingType
+  // via the same name table the decoder factory uses.
+  RockchipMppVideoEncoderImpl(const SdpVideoFormat &format,
+                              MppCodingType coding);
+  ~RockchipMppVideoEncoderImpl() override;
 
   // VideoEncoder overrides
   int InitEncode(const VideoCodec *codec_settings,
@@ -71,6 +77,8 @@ private:
 
   // Format from SDP (profile-level-id, packetization-mode, etc.)
   const SdpVideoFormat format_;
+  // Which MPP encoder pipeline to drive.
+  const MppCodingType coding_;
 
   // Owned by factory client; not freed by us
   EncodedImageCallback *encoded_callback_ = nullptr;
@@ -92,12 +100,17 @@ private:
   int target_bps_ = 1'500'000;
   int gop_len_ = 60;
 
-  // SPS/PPS cached after init via MPP_ENC_GET_HDR_SYNC; libwebrtc expects
-  // SPS/PPS prepended to the first IDR.
+  // Parameter sets cached after init via MPP_ENC_GET_HDR_SYNC; libwebrtc
+  // expects them prepended to every IDR access unit so a late-joining
+  // receiver can decode without waiting for a fresh SPS/PPS (or VPS+SPS+PPS
+  // for H.265).
   std::vector<uint8_t> hdr_pps_sps_;
 
-  // H.264 bitstream parser for QP / SVC info
+  // Bitstream parsers for QP extraction (best-effort — used only for
+  // stats/pacer feedback). One of these is exercised per Encode() call
+  // depending on coding_; the unused one stays a no-op.
   H264BitstreamParser h264_parser_;
+  H265BitstreamParser h265_parser_;
 
   // Initialized flag — also gates Encode() against unconfigured state
   bool initialized_ = false;
