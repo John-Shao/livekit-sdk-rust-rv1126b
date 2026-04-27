@@ -54,10 +54,19 @@ private:
   // Returns 0 on success, otherwise MPP_RET.
   int initMppContext();
   void teardownMppContext();
-  // Drain MPP one frame; returns true if a frame was decoded + delivered
-  // to decoded_complete_callback_, false otherwise (timeout / info-change /
-  // error). Caller should loop while we may still have buffered frames.
-  bool drainOneFrame(uint32_t rtp_timestamp);
+  enum class DrainResult {
+    kNothing,     // timeout / null / error — exit drain loop
+    kInfoChange,  // size-change handshake done, retry immediately for the
+                  // real frame queued behind it
+    kFrame,       // delivered a real frame to decoded_complete_callback_;
+                  // exit the drain loop unless caller knows more are pending
+  };
+  // Drain MPP for one decode_get_frame attempt. Caller decides whether to
+  // loop based on the returned status — the previous bool-return version
+  // ate a 100ms timeout per Decode() call right after delivering a frame
+  // because it couldn't tell "frame done" apart from "info_change handled
+  // but real frame coming".
+  DrainResult drainOneFrame(uint32_t rtp_timestamp);
 
   // Format from SDP (profile-level-id, packetization-mode, etc.).
   const SdpVideoFormat format_;

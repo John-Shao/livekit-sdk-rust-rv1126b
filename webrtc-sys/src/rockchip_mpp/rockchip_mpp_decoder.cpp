@@ -125,13 +125,17 @@ int32_t RockchipMppH264DecoderImpl::Decode(const EncodedImage &input_image,
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 
-  // 3. Drain whatever frames are ready. drainOneFrame returns true while
-  //    something useful happens (a delivered frame, or absorbed
-  //    info-change / discard). If everything's quiet we exit and let the
-  //    caller's next packet trigger more output.
-  for (int i = 0; i < 8; ++i) {
-    if (!drainOneFrame(input_image.RtpTimestamp()))
+  // 3. Drain frames. Typical case: 1 packet in → 1 frame out, so we exit
+  //    immediately after delivering that frame. info_change resolves
+  //    without a frame payload — loop again to grab the actual frame
+  //    queued behind it. Cap the iterations as a sanity guard against
+  //    unexpected MPP states.
+  for (int i = 0; i < 4; ++i) {
+    DrainResult rc = drainOneFrame(input_image.RtpTimestamp());
+    if (rc == DrainResult::kFrame || rc == DrainResult::kNothing) {
       break;
+    }
+    // info_change → retry to fetch the real frame
   }
 
   return WEBRTC_VIDEO_CODEC_OK;
@@ -201,17 +205,18 @@ int RockchipMppH264DecoderImpl::initMppContext() {
   return 0;
 }
 
-bool RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
+RockchipMppH264DecoderImpl::DrainResult
+RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
   MppFrame frame = nullptr;
   MPP_RET ret = mpp_api_->decode_get_frame(mpp_ctx_, &frame);
   if (ret == MPP_ERR_TIMEOUT || !frame) {
-    return false; // nothing to do this round
+    return DrainResult::kNothing;
   }
   if (ret) {
     RTC_LOG(LS_ERROR) << "[mpp-dec] decode_get_frame failed: " << ret;
     if (frame)
       mpp_frame_deinit(&frame);
-    return false;
+    return DrainResult::kNothing;
   }
 
   // info-change handshake: first frame after Configure (or after a
@@ -229,33 +234,35 @@ bool RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
     width_ = static_cast<int>(w);
     height_ = static_cast<int>(h);
 
-    if (frm_grp_) {
-      // Resolution shift: tear down old group, build a new one sized for
-      // the new buf_size. MPP will pull buffers back as it finishes its
-      // pending frames.
-      mpp_buffer_group_clear(frm_grp_);
-    } else {
+    if (!frm_grp_) {
       MPP_RET grp_ret = mpp_buffer_group_get_internal(
           &frm_grp_, MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE);
       if (grp_ret) {
         RTC_LOG(LS_ERROR) << "[mpp-dec] buffer_group_get_internal failed: "
                           << grp_ret;
         mpp_frame_deinit(&frame);
-        return false;
+        return DrainResult::kNothing;
       }
-      // 24 buffers = mpi_dec_test default; covers worst-case reordering
-      // for B-frames-heavy AVC. WebRTC streams are typically GOP-only
-      // (no B), so we usually consume far fewer.
-      mpp_buffer_group_limit_config(frm_grp_, buf_size, 24);
       MPP_RET set_ret = mpp_api_->control(mpp_ctx_, MPP_DEC_SET_EXT_BUF_GROUP,
                                           frm_grp_);
       if (set_ret) {
         RTC_LOG(LS_ERROR) << "[mpp-dec] MPP_DEC_SET_EXT_BUF_GROUP failed: "
                           << set_ret;
         mpp_frame_deinit(&frame);
-        return false;
+        return DrainResult::kNothing;
       }
     }
+    // Re-set the per-buffer size cap on every info_change. Initial cap
+    // was sized for the first frame's buf_size; simulcast layer upgrades
+    // grow the frame (e.g. 92 KB → 471 KB at 180x320 → 720x480) and
+    // mpp_buffer_create then fails with "reach group size limit", which
+    // freezes decoding while audio keeps flowing — a really nasty failure
+    // mode because the group LOOKS fine. 24 buffers = mpi_dec_test default;
+    // covers worst-case reordering for B-frames-heavy AVC. WebRTC streams
+    // are typically GOP-only (no B), so we usually consume far fewer.
+    mpp_buffer_group_limit_config(frm_grp_, buf_size, 24);
+    // Clear stale buffers so MPP can repopulate at the new size.
+    mpp_buffer_group_clear(frm_grp_);
     MPP_RET ack_ret = mpp_api_->control(mpp_ctx_,
                                         MPP_DEC_SET_INFO_CHANGE_READY, nullptr);
     if (ack_ret) {
@@ -263,7 +270,7 @@ bool RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
                         << ack_ret;
     }
     mpp_frame_deinit(&frame);
-    return true; // try next get_frame — real frame may follow immediately
+    return DrainResult::kInfoChange;
   }
 
   // Real decoded frame.
@@ -273,7 +280,9 @@ bool RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
     RTC_LOG(LS_VERBOSE) << "[mpp-dec] frame err=" << err_info
                         << " discard=" << discard;
     mpp_frame_deinit(&frame);
-    return true; // skip but keep draining
+    // Treat as nothing-delivered so the loop bails — we don't expect more
+    // frames immediately after a discarded one.
+    return DrainResult::kNothing;
   }
 
   RK_U32 fw = mpp_frame_get_width(frame);
@@ -283,13 +292,13 @@ bool RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
   MppBuffer buf = mpp_frame_get_buffer(frame);
   if (!buf || fw == 0 || fh == 0) {
     mpp_frame_deinit(&frame);
-    return true;
+    return DrainResult::kNothing;
   }
 
   const uint8_t *src = static_cast<const uint8_t *>(mpp_buffer_get_ptr(buf));
   if (!src) {
     mpp_frame_deinit(&frame);
-    return true;
+    return DrainResult::kNothing;
   }
   mpp_buffer_sync_begin(buf);
 
@@ -303,7 +312,7 @@ bool RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
                       << fh;
     mpp_buffer_sync_end(buf);
     mpp_frame_deinit(&frame);
-    return true;
+    return DrainResult::kNothing;
   }
 
   const uint8_t *src_y = src;
@@ -328,10 +337,18 @@ bool RockchipMppH264DecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
 
   decoded_complete_callback_->Decoded(decoded_frame, std::nullopt,
                                       std::nullopt);
-  return true;
+  return DrainResult::kFrame;
 }
 
 void RockchipMppH264DecoderImpl::teardownMppContext() {
+  // Drain MPP first so its internal queues release references to our
+  // external buffer group + input packet. Without this, mpp_destroy
+  // leaves dangling references that libmpp's atexit service handlers
+  // (mpp_buffer_service_deinit, mpp_meta_srv_deinit) later try to clean
+  // up — touching freed memory and segfaulting at process exit.
+  if (mpp_api_ && mpp_ctx_) {
+    mpp_api_->reset(mpp_ctx_);
+  }
   if (packet_) {
     mpp_packet_deinit(&packet_);
     packet_ = nullptr;
