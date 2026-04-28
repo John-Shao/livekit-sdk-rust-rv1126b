@@ -26,11 +26,13 @@
 #include <string>
 #include <thread>
 
+#include "api/make_ref_counted.h"
 #include "api/video/i420_buffer.h"
 #include "api/video/nv12_buffer.h"
 #include "api/video/video_frame.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/logging.h"
+#include "third_party/libyuv/include/libyuv/convert.h"
 
 extern "C" {
 #include "mpp_err.h"
@@ -49,6 +51,78 @@ const char *codingTypeName(MppCodingType c) {
     default:                   return "Unknown";
   }
 }
+
+// Phase 7.6.a: NV12BufferInterface wrapping an MppBuffer directly,
+// so the consumer reads the same physical memory MPP wrote into and
+// we skip the row-by-row stride-strip memcpy that drainOneFrame used
+// to do. The MppBuffer's hor_stride is reported to downstream as
+// StrideY/StrideUV — every consumer in our chain (FFI cvt_nv12,
+// libyuv NV12-to-X helpers, BoardLoopback's DRM display) honors
+// stride properly, so wider-than-width strides are fine.
+//
+// Lifecycle: we mpp_buffer_inc_ref in the constructor, mpp_buffer_put
+// in the destructor. The MPP buffer pool can recycle this buffer only
+// after our last RefCount-holder releases the wrapper. With 24
+// buffers in the decoder pool (configured in initMppContext via
+// limit_config), this leaves comfortable headroom for the SDK's
+// jitter buffer + render queue + simulcast layer transitions.
+class MppNV12Buffer : public NV12BufferInterface {
+ public:
+  static scoped_refptr<MppNV12Buffer> Create(MppBuffer mpp_buf, int width,
+                                             int height, int stride) {
+    if (!mpp_buf) return nullptr;
+    return make_ref_counted<MppNV12Buffer>(mpp_buf, width, height, stride);
+  }
+
+  MppNV12Buffer(MppBuffer mpp_buf, int width, int height, int stride)
+      : mpp_buf_(mpp_buf), width_(width), height_(height), stride_(stride) {
+    mpp_buffer_inc_ref(mpp_buf_);
+  }
+
+  ~MppNV12Buffer() override {
+    if (mpp_buf_) mpp_buffer_put(mpp_buf_);
+  }
+
+  int width() const override { return width_; }
+  int height() const override { return height_; }
+  int StrideY() const override { return stride_; }
+  int StrideUV() const override { return stride_; }
+
+  const uint8_t *DataY() const override {
+    return static_cast<const uint8_t *>(mpp_buffer_get_ptr(mpp_buf_));
+  }
+  // UV plane sits right after the Y plane in the MPP buffer at
+  // hor_stride * ver_stride bytes. We track that offset through the
+  // height the caller passed in (which for cache-coherent layouts is
+  // also the ver_stride MPP picked) — see the construction site, where
+  // we pass mpp_frame_get_ver_stride(), not the visible height.
+  const uint8_t *DataUV() const override {
+    return DataY() + static_cast<size_t>(stride_) * uv_offset_rows_;
+  }
+
+  scoped_refptr<I420BufferInterface> ToI420() override {
+    auto i420 = I420Buffer::Create(width_, height_);
+    libyuv::NV12ToI420(DataY(), StrideY(), DataUV(), StrideUV(),
+                       i420->MutableDataY(), i420->StrideY(),
+                       i420->MutableDataU(), i420->StrideU(),
+                       i420->MutableDataV(), i420->StrideV(),
+                       width_, height_);
+    return i420;
+  }
+
+  // Setter used by the decoder right after construction to record the
+  // ver_stride MPP allocated (which is >= height_ and is the correct
+  // offset to the UV plane inside the MppBuffer).
+  void set_uv_offset_rows(int rows) { uv_offset_rows_ = rows; }
+
+ private:
+  MppBuffer mpp_buf_;
+  int width_;
+  int height_;
+  int stride_;       // hor_stride (== StrideY == StrideUV in NV12)
+  int uv_offset_rows_ = 0;  // ver_stride; set by decoder after Create()
+};
+
 } // namespace
 
 RockchipMppVideoDecoderImpl::RockchipMppVideoDecoderImpl(
@@ -341,44 +415,28 @@ RockchipMppVideoDecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
     mpp_frame_deinit(&frame);
     return DrainResult::kNothing;
   }
+  // Phase 7.6.a — zero-copy decoder output: instead of allocating a fresh
+  // tight-NV12 buffer and stride-stripping into it, hand the consumer a
+  // wrapper around the MppBuffer directly. mpp_buffer_sync_begin
+  // invalidates the CPU cache so subsequent reads see the hardware-
+  // written data; the wrapper's MppBuffer ref keeps the buffer out of
+  // MPP's pool until every consumer has released the wrapper. Saves
+  // ~1.4 MB/frame (Y + UV) of memcpy at 720p, ~42 MB/s at 30 fps —
+  // about 3% of one A53 core back to the rest of the pipeline.
   mpp_buffer_sync_begin(buf);
 
-  // NV12 stride-strip into a fresh NV12Buffer. We used to convert to I420
-  // via libyuv NV12ToI420 here, but the SDK FFI's downstream conversion
-  // pipeline (livekit-ffi/server/colorcvt) only supports I420→NV12 if the
-  // source is already NV12 — going through I420 forced a round trip
-  // (NV12→I420 here, I420→NV12 in the consumer's DRM display path), each
-  // ~1.4 MB at 720p × 30 fps = ~42 MB/s of pointless memory traffic per
-  // direction. Returning NV12 lets the FFI's cvt_nv12 path fall through to
-  // a single nv12_copy memcpy and the consumer skip the second conversion.
-  //
-  // MPP's hor_stride / ver_stride are usually larger than width / height
-  // (16-aligned at minimum), so we still copy row-by-row to strip stride
-  // padding into the NV12Buffer's tight (stride == width) layout.
-  webrtc::scoped_refptr<webrtc::NV12Buffer> nv12 = webrtc::NV12Buffer::Create(
-      static_cast<int>(fw), static_cast<int>(fh));
+  scoped_refptr<MppNV12Buffer> nv12 = MppNV12Buffer::Create(
+      buf, static_cast<int>(fw), static_cast<int>(fh),
+      static_cast<int>(hor_stride));
   if (!nv12) {
-    RTC_LOG(LS_ERROR) << "[mpp-dec] NV12Buffer::Create failed " << fw << "x"
+    RTC_LOG(LS_ERROR) << "[mpp-dec] MppNV12Buffer::Create failed " << fw << "x"
                       << fh;
-    mpp_buffer_sync_end(buf);
     mpp_frame_deinit(&frame);
     return DrainResult::kNothing;
   }
-
-  const uint8_t *src_y = src;
-  const uint8_t *src_uv = src + static_cast<size_t>(hor_stride) * ver_stride;
-  uint8_t *dst_y = nv12->MutableDataY();
-  uint8_t *dst_uv = nv12->MutableDataUV();
-  int dst_stride_y = nv12->StrideY();
-  int dst_stride_uv = nv12->StrideUV();
-  for (int row = 0; row < static_cast<int>(fh); ++row) {
-    std::memcpy(dst_y + row * dst_stride_y, src_y + row * hor_stride, fw);
-  }
-  int chroma_h = (static_cast<int>(fh) + 1) / 2;
-  for (int row = 0; row < chroma_h; ++row) {
-    std::memcpy(dst_uv + row * dst_stride_uv, src_uv + row * hor_stride, fw);
-  }
-  mpp_buffer_sync_end(buf);
+  // The UV plane sits at hor_stride * ver_stride bytes inside the Y
+  // plane; record the row count so DataUV() can compute the offset.
+  nv12->set_uv_offset_rows(static_cast<int>(ver_stride));
 
   VideoFrame decoded_frame =
       VideoFrame::Builder()
@@ -386,6 +444,9 @@ RockchipMppVideoDecoderImpl::drainOneFrame(uint32_t rtp_timestamp) {
           .set_rtp_timestamp(rtp_timestamp)
           .build();
 
+  // mpp_frame_deinit drops the frame's ref to `buf`, but our wrapper
+  // (just constructed via mpp_buffer_inc_ref) keeps it alive until the
+  // VideoFrame's last consumer releases it.
   mpp_frame_deinit(&frame);
 
   decoded_complete_callback_->Decoded(decoded_frame, std::nullopt,
