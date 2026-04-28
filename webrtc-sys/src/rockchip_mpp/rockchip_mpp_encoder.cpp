@@ -28,6 +28,7 @@
 #include <string>
 
 #include "api/video/i420_buffer.h"
+#include "api/video/nv12_buffer.h"
 #include "api/video/video_frame_buffer.h"
 #include "api/array_view.h"
 #include "modules/video_coding/codecs/h264/include/h264_globals.h"
@@ -199,17 +200,27 @@ int RockchipMppVideoEncoderImpl::Encode(
     return WEBRTC_VIDEO_CODEC_OK; // nobody listening yet
   }
 
-  // 1. Pull I420 view of the source frame and copy/convert into the
-  //    pre-allocated MppBuffer at hor_stride/ver_stride.
-  webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 =
-      frame.video_frame_buffer()->ToI420();
-  if (!i420) {
+  // 1. Get the source buffer into NV12 layout inside our pre-allocated
+  //    MppBuffer at hor_stride/ver_stride.
+  //
+  //    Phase 7.5 fast path: if the upstream buffer is already kNV12
+  //    (e.g. BoardLoopback's V4L2 capture publishes NV12 directly), we
+  //    can just stride-strip memcpy into the MPP buffer and skip the
+  //    NV12 → I420 → NV12 round trip libwebrtc would otherwise force.
+  //    At 720p30 that round trip is ~90 MB/s of pointless memory traffic
+  //    plus two libyuv conversions. The slow path (I420ToNV12 below) is
+  //    kept for non-NV12 sources (synthetic RGBA test frames, peers that
+  //    deliver I420, etc.) so this stays a pure optimisation, not a
+  //    behavioural change.
+  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer =
+      frame.video_frame_buffer();
+  if (!buffer) {
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
-  if (i420->width() != width_ || i420->height() != height_) {
-    RTC_LOG(LS_WARNING) << "[mpp] frame size " << i420->width() << "x"
-                        << i420->height() << " != configured " << width_ << "x"
-                        << height_ << " — skipping";
+  if (buffer->width() != width_ || buffer->height() != height_) {
+    RTC_LOG(LS_WARNING) << "[mpp] frame size " << buffer->width() << "x"
+                        << buffer->height() << " != configured " << width_
+                        << "x" << height_ << " — skipping";
     return WEBRTC_VIDEO_CODEC_OK;
   }
 
@@ -217,9 +228,39 @@ int RockchipMppVideoEncoderImpl::Encode(
   if (!dst)
     return WEBRTC_VIDEO_CODEC_ERROR;
   mpp_buffer_sync_begin(frm_buf_);
-  I420ToNV12(i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(),
-             i420->DataV(), i420->StrideV(), width_, height_, dst, hor_stride_,
-             ver_stride_);
+
+  if (buffer->type() == webrtc::VideoFrameBuffer::Type::kNV12) {
+    const webrtc::NV12BufferInterface *nv12 = buffer->GetNV12();
+    const uint8_t *src_y = nv12->DataY();
+    const uint8_t *src_uv = nv12->DataUV();
+    const int src_stride_y = nv12->StrideY();
+    const int src_stride_uv = nv12->StrideUV();
+    uint8_t *dst_y = dst;
+    uint8_t *dst_uv = dst + static_cast<size_t>(hor_stride_) * ver_stride_;
+    // Y plane: width_ bytes per row, height_ rows. Source stride may
+    // exceed width_; destination stride is hor_stride_ for MPP.
+    for (int row = 0; row < height_; ++row) {
+      std::memcpy(dst_y + row * hor_stride_,
+                  src_y + row * src_stride_y, width_);
+    }
+    // Interleaved UV plane: chroma_h rows, each width_ bytes (one U/V
+    // pair per chroma column → 2 bytes each, * chroma_w pairs == width_).
+    const int chroma_h = (height_ + 1) / 2;
+    for (int row = 0; row < chroma_h; ++row) {
+      std::memcpy(dst_uv + row * hor_stride_,
+                  src_uv + row * src_stride_uv, width_);
+    }
+  } else {
+    webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 = buffer->ToI420();
+    if (!i420) {
+      mpp_buffer_sync_end(frm_buf_);
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+    I420ToNV12(i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(),
+               i420->DataV(), i420->StrideV(), width_, height_, dst,
+               hor_stride_, ver_stride_);
+  }
+
   mpp_buffer_sync_end(frm_buf_);
 
   // 2. Force-IDR if libwebrtc requested a keyframe.
