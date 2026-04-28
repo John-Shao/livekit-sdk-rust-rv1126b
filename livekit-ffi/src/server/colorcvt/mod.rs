@@ -12,11 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::server::FfiHandle;
 use crate::{proto, FfiResult};
 use livekit::webrtc::{prelude::*, video_frame::BoxVideoBuffer};
 use std::slice;
 
 pub mod cvtimpl;
+
+/// Storage variant returned by [`to_video_buffer_info`].
+///
+/// Phase 7.6.b — when the requested destination format matches the source
+/// format and no per-row processing is needed (e.g. NV12 → NV12 with no
+/// flip_y), we keep the original [`BoxVideoBuffer`] alive in the FFI
+/// handle store and let the consumer read pixels straight out of it,
+/// instead of allocating a fresh `Box<[u8]>` and memcpy'ing into it.
+/// At 720p30 that saves ~42 MB/s of pointless memory traffic in the
+/// FFI conversion stage.
+pub enum BufferStorage {
+    /// A freshly allocated tight-packed buffer produced by a colour-space
+    /// conversion (e.g. I420 → NV12) or a stride-normalising copy. The
+    /// returned [`proto::VideoBufferInfo`] points into this slice.
+    Owned(Box<[u8]>),
+    /// Pass-through: the [`proto::VideoBufferInfo`] points into the
+    /// underlying [`BoxVideoBuffer`]'s pixel memory. We hold the box
+    /// alive in the handle store so the pointer stays valid.
+    Native(BoxVideoBuffer),
+}
+
+impl FfiHandle for BufferStorage {}
 
 pub unsafe fn to_libwebrtc_buffer(info: proto::VideoBufferInfo) -> BoxVideoBuffer {
     let r#type = info.r#type();
@@ -122,11 +145,23 @@ pub unsafe fn to_libwebrtc_buffer(info: proto::VideoBufferInfo) -> BoxVideoBuffe
     }
 }
 
+/// Run cvtimpl::cvt and wrap the returned owned slice in
+/// [`BufferStorage::Owned`]. All arms that fall through the legacy
+/// "always memcpy into a fresh buffer" path use this.
+fn cvt_owned(
+    info: proto::VideoBufferInfo,
+    dst_type: proto::VideoBufferType,
+    flip_y: bool,
+) -> FfiResult<(BufferStorage, proto::VideoBufferInfo)> {
+    let (data, out_info) = unsafe { cvtimpl::cvt(info, dst_type, flip_y) }?;
+    Ok((BufferStorage::Owned(data), out_info))
+}
+
 pub fn to_video_buffer_info(
     rtcbuffer: BoxVideoBuffer,
     dst_type: Option<proto::VideoBufferType>,
     _normalize_stride: bool, // always normalize stride for now..
-) -> FfiResult<(Box<[u8]>, proto::VideoBufferInfo)> {
+) -> FfiResult<(BufferStorage, proto::VideoBufferInfo)> {
     match rtcbuffer.buffer_type() {
         // Convert Native buffer to I420
         VideoBufferType::Native => {
@@ -145,7 +180,7 @@ pub fn to_video_buffer_info(
                 stride_u,
                 stride_v,
             );
-            unsafe { cvtimpl::cvt(info, dst_type.unwrap_or(proto::VideoBufferType::I420), false) }
+            cvt_owned(info, dst_type.unwrap_or(proto::VideoBufferType::I420), false)
         }
         VideoBufferType::I420 => {
             let i420 = rtcbuffer.as_i420().unwrap();
@@ -163,7 +198,7 @@ pub fn to_video_buffer_info(
                 stride_u,
                 stride_v,
             );
-            unsafe { cvtimpl::cvt(info, dst_type.unwrap_or(proto::VideoBufferType::I420), false) }
+            cvt_owned(info, dst_type.unwrap_or(proto::VideoBufferType::I420), false)
         }
         VideoBufferType::I420A => {
             let i420 = rtcbuffer.as_i420a().unwrap();
@@ -183,7 +218,7 @@ pub fn to_video_buffer_info(
                 stride_v,
                 stride_a,
             );
-            unsafe { cvtimpl::cvt(info, dst_type.unwrap_or(proto::VideoBufferType::I420a), false) }
+            cvt_owned(info, dst_type.unwrap_or(proto::VideoBufferType::I420a), false)
         }
         VideoBufferType::I422 => {
             let i422 = rtcbuffer.as_i422().unwrap();
@@ -201,7 +236,7 @@ pub fn to_video_buffer_info(
                 stride_u,
                 stride_v,
             );
-            unsafe { cvtimpl::cvt(info, dst_type.unwrap_or(proto::VideoBufferType::I422), false) }
+            cvt_owned(info, dst_type.unwrap_or(proto::VideoBufferType::I422), false)
         }
         VideoBufferType::I444 => {
             let i444 = rtcbuffer.as_i444().unwrap();
@@ -219,7 +254,7 @@ pub fn to_video_buffer_info(
                 stride_u,
                 stride_v,
             );
-            unsafe { cvtimpl::cvt(info, dst_type.unwrap_or(proto::VideoBufferType::I444), false) }
+            cvt_owned(info, dst_type.unwrap_or(proto::VideoBufferType::I444), false)
         }
         VideoBufferType::I010 => {
             let i010 = rtcbuffer.as_i010().unwrap();
@@ -237,7 +272,7 @@ pub fn to_video_buffer_info(
                 stride_u,
                 stride_v,
             );
-            unsafe { cvtimpl::cvt(info, dst_type.unwrap_or(proto::VideoBufferType::I010), false) }
+            cvt_owned(info, dst_type.unwrap_or(proto::VideoBufferType::I010), false)
         }
         VideoBufferType::NV12 => {
             let nv12 = rtcbuffer.as_nv12().unwrap();
@@ -253,7 +288,20 @@ pub fn to_video_buffer_info(
                 stride_y,
                 stride_uv,
             );
-            unsafe { cvtimpl::cvt(info, dst_type.unwrap_or(proto::VideoBufferType::Nv12), false) }
+            // Phase 7.6.b fast path: when the consumer wants NV12 (the
+            // dominant case for our DRM display pipeline + the common
+            // case across H.264/H.265 hardware decoders that emit NV12),
+            // skip cvt's nv12_copy memcpy entirely. The info above
+            // already points into the source NV12 buffer's memory, and
+            // BufferStorage::Native keeps that buffer alive in the FFI
+            // handle store until the consumer drops the frame handle.
+            // ~42 MB/s of bandwidth at 720p30 returned to the rest of
+            // the pipeline.
+            let dst = dst_type.unwrap_or(proto::VideoBufferType::Nv12);
+            if dst == proto::VideoBufferType::Nv12 {
+                return Ok((BufferStorage::Native(rtcbuffer), info));
+            }
+            cvt_owned(info, dst, false)
         }
         _ => todo!(),
     }
